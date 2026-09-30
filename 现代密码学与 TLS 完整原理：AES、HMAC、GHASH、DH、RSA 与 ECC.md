@@ -326,7 +326,9 @@ $$
 
 ## 四、从分组密码到任意长度消息
 
-### 4.1 ECB 为什么不安全
+本章以 AES（Advanced Encryption Standard，高级加密标准）为分组密码，说明如何处理任意长度的消息。
+
+### 4.1 ECB（Electronic Codebook，电子密码本模式）为什么不安全
 
 ECB 对每个分组独立计算：
 
@@ -336,19 +338,19 @@ $$
 
 相同明文块产生相同密文块，图像纹理、记录类型和重复结构会泄露。即使 AES 本身没有被破解，消息模式也已经暴露。
 
-### 4.2 CBC 与 Padding
+### 4.2 CBC（Cipher Block Chaining，密文分组链接模式）与 Padding（填充）
 
-CBC：
+CBC 使用 IV（Initialization Vector，初始化向量）作为第一块的链接输入：
 
 $$
 C_i=E_K(P_i\oplus C_{i-1}),\qquad C_0=IV
 $$
 
-明文必须填充到完整分组。CBC 只提供机密性，必须另加 MAC；错误的“先解密、再根据不同错误返回 Padding/MAC 失败”会形成 Padding Oracle。
+明文必须填充到完整分组。CBC 只提供机密性，必须另加 MAC（Message Authentication Code，消息认证码）；错误的“先解密、再根据不同错误返回 Padding/MAC 失败”会形成 Padding Oracle（填充预言机攻击）。
 
-历史 TLS 的 CBC 套件需要精细处理 MAC、Padding、错误时序和 IV，协议复杂度高，已不属于 TLS 1.3。
+历史 TLS（Transport Layer Security，传输层安全协议）的 CBC 套件需要精细处理 MAC、Padding、错误时序和 IV，协议复杂度高，已不属于 TLS 1.3。
 
-### 4.3 CTR：把 AES 变成密钥流
+### 4.3 CTR（Counter Mode，计数器模式）：把 AES 变成密钥流
 
 CTR 为每个计数器块生成密钥流：
 
@@ -374,13 +376,13 @@ $$
 
 而且 CTR 本身可篡改：翻转密文某一位会翻转明文对应位。因此实际协议应优先使用 AEAD，而不是“裸 CTR”。
 
-### 4.4 为什么现代协议选择 AEAD
+### 4.4 为什么现代协议选择 AEAD（Authenticated Encryption with Associated Data，带关联数据的认证加密）
 
-AEAD（Authenticated Encryption with Associated Data）同时保护：
+AEAD 同时保护：
 
 - 明文 $P$：加密且认证；
-- 附加认证数据 AAD：不加密但认证；
-- Nonce：由调用方按算法约束提供；GCM 等方案要求同一密钥下不重复。
+- 附加认证数据 AAD（Additional Authenticated Data）：不加密但认证；
+- Nonce（number used once，一次性数值）：由调用方按算法约束提供；GCM（Galois/Counter Mode，伽罗瓦/计数器模式）等方案要求同一密钥下不重复。
 
 接口可抽象为：
 
@@ -402,13 +404,13 @@ ChaCha20 是流密码，不依赖 AES 分组变换。它把以下内容排成 16
 4 个常量 || 8 个 Key word || 1 个 Block Counter || 3 个 Nonce word
 ```
 
-IETF 版本使用 256 bit Key、32 bit Block Counter 和 96 bit Nonce。所有 word 按小端解释。核心 Quarter Round 只使用三类运算：
+IETF（Internet Engineering Task Force，互联网工程任务组）版本使用 256 bit Key、32 bit Block Counter 和 96 bit Nonce。所有 word 按小端解释。核心 Quarter Round（四分之一轮）只使用三类运算：
 
 - 32 bit 模加法（Add）；
 - XOR；
 - 固定位数循环左移（Rotate）。
 
-这类结构简称 ARX。对四个 32 bit word $(a,b,c,d)$，Quarter Round 为：
+这类结构简称 ARX（Addition–Rotation–XOR，即模加法、循环移位、异或）。对四个 32 bit word $(a,b,c,d)$，Quarter Round 为：
 
 ```text
 a += b; d ^= a; d <<< 16
@@ -417,7 +419,7 @@ a += b; d ^= a; d <<<  8
 c += d; b ^= c; b <<<  7
 ```
 
-ChaCha20 对 4×4 状态交替执行列 Quarter Round 和对角 Quarter Round；一组列轮加一组对角轮称为 Double Round。重复 10 个 Double Round 共 20 轮后，把工作状态与初始状态逐 word 模 $2^{32}$ 相加，再按小端序列化，得到 64 字节密钥流块。
+ChaCha20 对 4×4 状态交替执行列 Quarter Round 和对角 Quarter Round；一组列轮加一组对角轮称为 Double Round（双轮）。重复 10 个 Double Round 共 20 轮后，把工作状态与初始状态逐 word 模 $2^{32}$ 相加，再按小端序列化，得到 64 字节密钥流块。
 
 第 $i$ 个明文块的加密为：
 
