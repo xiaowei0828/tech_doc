@@ -1,10 +1,22 @@
-# 媒体封装格式详解：fMP4、FLV 与 TS 的结构原理
+# 媒体封装与实时传输详解：fMP4、FLV、TS、RTMP 与 WebRTC
 
-## 一、什么是媒体封装格式
+本文按“编码基础 → 文件/流容器 → 实时传输与连通性 → 格式转换 → 工程检查”组织。多字节整数默认按对应协议的字节序读取；示例中的 `[数据]` 为占位符，不代表完整可解码码流。
 
-### 1.1 封装格式的本质
+|章节|内容|
+|---|---|
+|一|编码、NALU、Access Unit 与参数集|
+|二～四|fMP4/CMAF、FLV、MPEG-2 TS 容器结构|
+|五|RTMP 消息与 Chunk|
+|六|RTP 头、WebRTC H.264 打包、RTCP 统计与反馈|
+|七|STUN 报文及 ICE 用法|
+|八|重封装、时间戳换算与配置映射|
+|九|首屏、同步、时移、延迟与选型|
 
-编码与封装解决的是两层问题：
+## 一、基础概念：编码、封装与传输
+
+### 1.1 三层分工
+
+媒体系统需要区分三个层次：
 
 - **编码（codec）**把原始像素或 PCM 采样压缩成编码访问单元，例如 AVC/H.264、HEVC/H.265、AAC。
 
@@ -14,7 +26,7 @@
 
 同一组 H.264/AAC 编码访问单元可以在不重新编码的前提下，从 FLV 重封装为 fMP4 或 TS；但前提是目标容器支持该编码，并且时间戳、参数集和随机访问信息能够正确映射。只改文件后缀既不会完成重封装，也不会改变编码格式。
 
-### 1.2 常见封装格式一览表
+### 1.2 格式与协议定位
 
 |格式/协议|规范体系|定位|典型应用|
 |---|---|---|---|
@@ -25,8 +37,10 @@
 |RTMP|Adobe RTMP Specification|基于 TCP 的消息与分块传输协议|直播推流、传统直播拉流|
 |TS|ITU-T H.222.0 / ISO/IEC 13818-1|固定包长的传输流封装|广播、传统 HLS|
 |Matroska|Matroska Specifications|EBML 容器|本地多轨存储|
+|RTP / RTCP|RFC 3550 及负载/反馈规范|实时媒体传输与质量反馈|WebRTC、实时音视频|
+|STUN|RFC 8489；ICE 使用见 RFC 8445|地址发现与连通性检查基础协议|WebRTC ICE/NAT 穿透|
 
-### 1.3 封装格式的核心职责
+### 1.3 容器需要描述的信息
 
 - 关联编码数据与解码配置，例如 SPS/PPS、`AVCDecoderConfigurationRecord`、`AudioSpecificConfig`
 
@@ -36,7 +50,7 @@
 
 - 组织视频、音频、字幕和元数据等多种轨道或基本流
 
-容器只负责**表达**这些信息，不保证源数据一定正确。例如把普通 P 帧误标成关键帧，仍会导致 Seek 后花屏；给音频写错采样率或时间戳，容器本身也无法修复同步。
+这些元数据必须与编码内容一致：把 P 帧误标为随机访问点、写错采样率或时间戳，都会造成解码或同步错误。
 
 ### 1.4 NALU：编码数据的承载单元
 
@@ -54,7 +68,7 @@
 
 - `forbidden_zero_bit`（1 bit）
 
-- `nal_ref_idc`（2 bit）：0 表示该 NALU 不用于后续图像参考，非 0 表示参考优先级
+- `nal_ref_idc`（2 bit）：指示参考重要性；对 VCL NALU，0 表示所属图像不用于后续参考，非 0 表示参考图像。参数集等非 VCL NALU 另有取值约束
 
 - `nal_unit_type`（5 bit）：类型
 
@@ -69,9 +83,9 @@
 |8|PPS|图像参数集|
 |9|AUD|Access Unit Delimiter|
 
-#### 两种 NALU 封装方式：Annex B vs AVCC
+#### 两种常见字节流/样本表示：Annex B vs AVCC
 
-这是理解各容器存储视频的核心区别。
+这是理解各容器存储视频的核心区别。RTP 另有编码相关的打包语法，H.264 的单 NALU、聚合与分片格式见第 6.4 节。
 
 |封装方式|NALU 前缀|使用场景|特点|
 |---|---|---|---|
@@ -100,7 +114,7 @@ IDR 会切断对 IDR 之前图像的参考，是最直接的随机访问起点�
 
 HEVC 在 TS 字节流中通常仍使用 Start Code；在 MP4/fMP4 中通常使用长度前缀，并由 `hvcC` 中的 `HEVCDecoderConfigurationRecord` 给出 NALU Length 长度及 VPS/SPS/PPS 等配置。Sample Entry 的名称还约束参数集位置：
 
-- `hvc1`：解码所需参数集只放在 Sample Entry 的配置记录中，sample 不携带参数集更新。
+- `hvc1`：参数集放在 Sample Entry 的配置记录中，sample 不应携带 VPS/SPS/PPS NALU。
 - `hev1`：参数集可以位于 Sample Entry，也可以出现在 sample 内。
 
 AVC 有对应的 `avc1`/`avc3` 区别。转封装时不能只复制 NALU：还必须根据 in-band 参数集的实际存在位置选择正确 Sample Entry，并在配置变化时更新初始化信息。把含 in-band VPS/SPS/PPS 的流误标成 `hvc1`，即使多数播放器“碰巧能播”，也不代表文件符合其信令语义。
@@ -109,21 +123,9 @@ AVC 有对应的 `avc1`/`avc3` 区别。转封装时不能只复制 NALU：还�
 
 ## 二、fMP4（Fragmented MP4）格式详解
 
-### 2.1 设计哲学
+### 2.1 Box 基础与分片模型
 
 fMP4 不是与 MP4 平行的另一套容器，而是 ISO BMFF（ISO/IEC 14496-12）的 **Movie Fragment** 组织方式。传统非分片 MP4 的逐 sample 索引主要位于 `moov` 的样本表中；fMP4 则把后续样本的索引拆到每个 `moof`，媒体字节仍放在 `mdat`。这样初始化信息可以先到达，后续分片可以边生成、边传输、边解析。
-
-“Movie Fragment、CMAF Fragment、Segment、Chunk”来自不同抽象层，不能只按 Box 外形无条件互换：
-
-- **Movie Fragment** 是 ISO BMFF 结构概念，核心是一个 `moof` 及其引用的媒体数据。
-
-- **Media Segment** 是 HLS、DASH 或 MSE 的交付概念，具体允许包含几个 Fragment 由相应格式约束决定。例如 W3C MSE 的 ISO BMFF media segment 定义为可选 `styp`、一个 `moof` 和一个或多个 `mdat`。
-
-- **CMAF Fragment** 是可独立解码的连续媒体对象，也是 CMAF Track 的切换边界；**CMAF Segment** 是同一 Track 中一个或多个连续 CMAF Fragment 的组合。
-
-- **CMAF Chunk** 是某个 CMAF Fragment 中一段连续 sample 子集，用于在整个 Fragment/Segment 完成前渐进交付；**HLS Partial Segment（Part）**是 HLS 清单与交付层的对象，可以用 CMAF Chunk 组织，但二者不是脱离上下文就永远一一等价的同义词。
-
-同一个 `moof + mdat` 字节组合在不同地址边界和应用格式中可能被称为 Movie Fragment、CMAF Fragment 或 CMAF Chunk。实现应以所遵循规范的对象边界、独立解码约束和清单引用方式为准，而不是用“看见一个 `moof` 就统一叫 Chunk”的启发式规则。
 
 #### Box 通用格式（ISO BMFF 基础）
 
@@ -150,11 +152,11 @@ fMP4 的所有数据都以 Box（也称 Atom）为单位组织。每个 Box 有�
 |1|使用扩展大小|Header 后紧跟 8 字节 uint64 表示真实总大小；32 bit 不够时必须使用，也允许生产者主动选择|
 |0|延伸到文件末尾|该 Box 必须是文件中的最后一个 Box，内容延伸到文件末尾；通常只用于顶层 `mdat`|
 
-解析不可信输入时，还要验证 Box 大小至少容纳自身 Header、没有越过父 Box/文件边界，并用足够宽的无符号整数检查 `offset + size` 溢出。`Size=1` 时 Header 已扩为 16 字节；不能先用 32 位加法计算末尾再读取 64 位扩展大小。未知 Box 可以按合法 Size 跳过，但非法 Size 不能靠“搜索下一个看似 ASCII 的 Type”静默恢复。
+解析时检查 Size 不小于实际头部、不越过父 Box/文件边界，且 `offset + size` 不溢出。普通类型 `Size=1` 时头部为 16B，`uuid` 还需再加 16B。未知 Box 可按合法 Size 跳过。
 
 #### Type 字段
 
-4 个 ASCII 字符，标识 Box 类型。常见类型：
+Type 是 32 bit 标识，通常写成四字符码（FourCC）；`uuid` 还需额外的 16B user type。常见类型：
 
 |Type|Hex|含义|
 |---|---|---|
@@ -215,7 +217,7 @@ fMP4 的所有数据都以 Box（也称 Atom）为单位组织。每个 Box 有�
 
 - **字段型 Box**（mvhd, tfdt, trun, mdat）：Data 区域按各自语法解释；其中 `mdat` 是不透明媒体字节，`trun` 等是结构化字段
 
-`stsd`、`meta` 等 Box 既有自身字段，又包含 Sample Entry/子 Box，不能仅靠“容器或叶子”二分法解析。通用解析器先读取 Size 和 Type，再根据已知 Box 语法决定是读取字段、递归解析子 Box，还是把内容视为不透明数据；Size 也让解析器能够跳过不认识的 Box。
+`stsd`、`meta` 等既有自身字段，又有 Sample Entry/子 Box；递归解析位置必须由具体语法决定。
 
 ### 2.2 整体架构
 
@@ -265,11 +267,11 @@ Movie 有自己的 `mvhd.timescale`，每个 Track 也有自己的 `mdhd.timesca
 
 ```
 
-在 W3C MSE 和 HLS 的分段媒体约束下，初始化段不携带 sample，相关样本表的 entry count 必须为 0，`moov` 还需包含 `mvex`。HLS 进一步要求 `mvhd` 与 `tkhd` 的 duration 为 0，且 `mvex` 位于最后一个 `trak` 之后。一般 ISO BMFF 文件则可以先包含非分片样本、再追加 Fragment，不能把这些流媒体约束外推到所有 fMP4 文件。
+在 [MSE ISO BMFF](https://www.w3.org/TR/mse-byte-stream-format-isobmff/#initialization-segments) 和 [HLS fMP4](https://www.rfc-editor.org/rfc/rfc8216#section-3.3) 中，初始化段的轨道不含媒体样本，但 `stsd` 仍需保留 Sample Entry；不能把“空样本表”理解成所有表项都清零。`moov` 还需包含 `mvex`；HLS 要求 `mvhd/tkhd.duration=0`，且 `mvex` 位于最后一个 `trak` 之后。一般 ISO BMFF 文件可以先有非分片样本、再追加 Fragment，不受这套初始化段约束。
 
-视频 timescale 常取 90000，音频 timescale 常直接取采样率，但这只是常见选择，不是固定要求。编码参数、Sample Entry 或加密配置变化时，清单可能切换到新的初始化段，因此“Init Segment 只下载一次”应理解为“同一配置期间可以缓存复用”。
+视频 timescale 常取 90000，音频常取采样率，但并非固定要求。Init Segment 可在同一配置期间缓存；配置切换见第 9.1 节。
 
-`ftyp`/`styp` 中的 brand 是内容对某套规则的**兼容性声明**，不是看到 `iso6`、`cmfc` 或 `dash` 就能忽略其余 Box 和 codec 配置。播放器仍需结合 Sample Entry、RFC 6381 `CODECS` 字符串、加密方案和自身解码能力判断是否可播；错误地声明兼容 brand 不会把不合规内容自动变得合规。
+`ftyp/styp` 的 brand 声明格式兼容性；可播放性还取决于 Sample Entry、`CODECS`、加密方案与终端能力。
 
 #### avcC Box：视频解码器的“说明书”（AVCDecoderConfigurationRecord）
 
@@ -289,14 +291,14 @@ Movie 有自己的 `mvhd.timescale`，每个 Track 也有自己的 `mdhd.timesca
 
 上表展示基础记录；部分 High Profile 配置还会在后面携带色度格式、位深和 SPS extension 等扩展字段。解析器应按 Profile 和记录长度继续解析或安全跳过，不能假设 PPS 之后必然立刻结束。
 
-**Hex Dump 示例（1080p High@3.1）:**
+**基础记录的字段示意（非完整可解码配置）：**
 
 ```text
-01 64 00 1F FF E1 00 1A 67 64 00 1F AC D9 40 50
-05 BB 01 10 00 00 03 00 10 00 00 03 03 C0 F1 62
-EE 01 00 04 68 EB E3 CB
-
+01 42 00 1E FF E1 [spsLength:2B] [SPS NALU]
+01 [ppsLength:2B] [PPS NALU]
 ```
+
+这里 `0x42` 表示 Baseline，`0x1E` 表示 Level 3.0，`0xFF` 指定 4B 长度前缀。分辨率必须解析 SPS，不能从 Profile/Level 字节直接推出；SPS/PPS 长度须按实际字节数填写。
 
 #### esds Box：音频解码器的“说明书”
 
@@ -340,7 +342,7 @@ EE 01 00 04 68 EB E3 CB
 
 `tfdt` 给出的是**轨道媒体时间轴**上的解码时间，不是 UTC 或系统墙钟时间。若需要估算直播端到端延迟，可用可选的 `prft`（Producer Reference Time）把媒体时间映射到 NTP 时间，或使用清单、协议层提供的节目日期时间。
 
-`trun` 也不一定逐 sample 显式携带所有字段。duration、size、flags 可以来自 `trun`，也可以继承 `tfhd`，再不然使用初始化段 `trex` 的默认值；`sample_description_index` 也按 `tfhd → trex` 解析。`first_sample_flags` 只覆盖该 run 的第一个 sample，并且不能与逐 sample 的 `sample_flags` 同时出现。解析器必须按照 flags 和继承优先级取值，不能把字段缺省解释为数值 0。
+`trun` 的 duration、size、flags 可逐 sample 给出，也可按 `tfhd → trex` 继承默认值；`sample_description_index` 按 `tfhd → trex` 选择。`first_sample_flags` 只覆盖 run 的第一个 sample，且不能与逐 sample 的 `sample_flags` 同时出现。缺省字段不等于 0。
 
 #### sample 如何定位到 mdat
 
@@ -360,8 +362,6 @@ $$
 = \operatorname{run\_start}
 + \sum_{i=0}^{k-1}\operatorname{sample\_size}(i)
 $$
-
-6. sample size、duration 和 flags 优先取 `trun` 中的逐 sample 字段；第一帧还可能使用 `first_sample_flags`；字段缺省时再取 `tfhd` 默认值，最后取 `trex` 默认值。
 
 解析器必须按 Box flags 建立每个 Fragment 的寻址状态，不能硬编码“媒体永远紧跟在 `moof` 后”，也不能在多个 `traf` 复用一个未经更新的游标。面向 MSE 的内容还需满足 movie-fragment relative addressing：每个 `traf` 的第一条 `trun` 带 `data_offset`，并且要么所有 `traf` 都设置 `default-base-is-moof`，要么当前 `moof` 仅有一个 `traf` 且未显式设置 `base_data_offset`。HLS fMP4 同样要求 movie-fragment-relative addressing。
 
@@ -404,25 +404,7 @@ sample duration 决定相邻 DTS 的距离，CTO 决定同一个 sample 从解�
 
 ### 2.6 音视频排布
 
-#### 分离式（自适应流媒体中常见）
-
-- 视频和音频在不同 URL/文件
-
-- 优势：ABR 切换互不影响、多语言独立切换
-
-- DASH/HLS 的常见实现会将不同码率、音轨和字幕轨分开寻址，便于 ABR 与多语言选择；规范和实际系统也允许复用音视频的变体
-
-#### 混合式
-
-- 一个 moof 含两个 traf (Track ID 区分)
-
-- 可用于复用音视频的文件或分段媒体，但 ABR 和多语言切换通常更偏好分离 Track 交付
-
-#### 同步机制
-
-- Track ID 关联：Init Segment 注册 → Media Segment 认领
-
-- 时间对齐：各轨先按自身 timescale 换算为秒，再结合编辑列表、演示时间线和协议层时间映射对齐；不同轨的数值不应直接相减
+自适应流媒体常将音视频分别寻址，以便独立选择码率和语言；也可以在同一 `moof` 中用多个 `traf` 复用轨道。`tfhd.track_ID` 关联初始化段中的 Track。同步时先用各自 timescale 换算，再结合编辑列表和协议层时间原点对齐。
 
 ### 2.7 Seek 机制
 
@@ -436,11 +418,20 @@ sample duration 决定相邻 DTS 的距离，CTO 决定同一个 sample 从解�
 
 - 到达候选片段后，再根据 sample flags、SAP/随机访问点信息和编码依赖选择可解码起点。没有 `sidx` 并不必然意味着从文件头扫描全部 `moof`。
 
-### 2.8 CMAF 低延迟扩展
+### 2.8 CMAF、Segment 与低延迟交付
 
-CMAF 是基于 ISO BMFF 的分段媒体应用格式与约束集合，定义 Track、Fragment、Chunk、品牌和可切换编码表示等规则，但不规定清单格式、播放器或网络传输协议。它可以被 HLS、DASH 等交付体系复用，从而减少重复封装。
+CMAF 是 ISO BMFF 的应用约束，可由 HLS/DASH 复用；它不定义清单或网络协议。以下对象不能仅凭名称互换：
 
-低延迟的关键是让尚未完成的较大 Segment 以更小 Chunk 尽早可用，并让服务端、CDN 与播放器及时传输和消费。实际延迟由 Chunk/GOP 时长、编码器、清单更新、网络传输和播放器缓冲共同决定，不能仅由“使用 CMAF”推导出固定秒数。
+|对象|含义|
+|---|---|
+|Movie Fragment|ISO BMFF 的分片结构，以 `moof` 描述关联媒体样本|
+|CMAF Fragment|满足 CMAF 约束、可独立解码的媒体对象；同一 Switching Set 可在相应边界切换|
+|CMAF Chunk|Fragment 中连续的 sample 子集，通常由一对 `moof + mdat` 承载，不要求独立解码|
+|CMAF Segment|同一 Track 的一个或多个完整 Fragment|
+|HLS/DASH Media Segment|交付层对象，其边界与内部结构由相应应用格式规定|
+|HLS Partial Segment（Part）|LL-HLS 的部分分段对象，可使用 CMAF Chunk 组织|
+
+低延迟交付让较大 Segment 尚未完成时，其已编码的子对象就可传输和消费。
 
 **一种常见的低延迟字节序列：**
 
@@ -452,24 +443,24 @@ CMAF 是基于 ISO BMFF 的分段媒体应用格式与约束集合，定义 Trac
 
 ```
 
-这些子对象在具体 CMAF 结构中可能组成一个或多个 Fragment，不能仅凭三个 `moof` 就断言“一个 Fragment 有三个 Chunk”。对象名称由 CMAF Header/Track、地址范围和清单关系共同确定。
+这些子对象可能组成一个或多个 Fragment，须结合随机访问边界和具体 CMAF 约束判断。
 
-在 Low-Latency HLS 中，短对象由 `EXT-X-PART` 标识为 HLS Partial Segment，完整 Parent Segment 覆盖与其 Parts 相同的媒体时间范围；`EXT-X-PRELOAD-HINT` 只预告可能即将出现的资源，不保证该资源最终一定按预告发布。Part 只有在 `INDEPENDENT=YES` 等相应信令与真实编码依赖都成立时才可独立起播，不能从 Parent Segment 独立或 Playlist 含 `EXT-X-INDEPENDENT-SEGMENTS` 直接推导“每一个 Part 都是随机访问点”。
+LL-HLS 用 `EXT-X-PART` 描述 Partial Segment，Parent Segment 覆盖各 Part 的总时间范围；`EXT-X-PRELOAD-HINT` 是预告，并不保证最终发布。只有满足真实独立解码条件的 Part 才能独立起播；Parent Segment 独立不代表每个 Part 独立。
 
-RFC 8216 要求每个 HLS fMP4 Segment 都有 `EXT-X-MAP` **作用于它**。这不等于必须在每个 Segment URI 前重复写一行：该 Tag 的作用会持续到新的 `EXT-X-MAP` 出现。配置、Track 集合或加密初始化信息改变时，应在正确边界发布新的 Map，并按变化类型配合 `EXT-X-DISCONTINUITY`；旧 Map 不能继续解释新 sample。
+HLS fMP4 Segment 必须有适用的 `EXT-X-MAP`；该 Tag 持续生效直到被新的 Map 替换，无需逐段重复。配置切换时更新 Map，并按变化类型配合 `EXT-X-DISCONTINUITY`。
 
 ---
 
 ## 三、FLV（Flash Video）格式详解
 
-### 3.1 设计哲学
+### 3.1 顺序 Tag 模型
 
 FLV 是顺序 Tag 流：文件头之后依次出现 Script、Audio、Video Tag。Tag 自带类型、负载长度和毫秒时间戳，因此接收端无需先得到全局样本表就能增量解复用。它不是严格意义上的“链表”——Tag 中没有 next 指针；可顺序前进依赖 `DataSize`，可辅助向后定位依赖 `PreviousTagSize`。
 
 ### 3.2 整体架构
 
 ```text
-[FLV Header (9字节)]
+[FLV Header (通常 9B，长度由 DataOffset 指定)]
 [PreviousTagSize₀ = 0]
 [Tag₁ Script] — onMetaData
 [PreviousTagSize₁]
@@ -484,7 +475,7 @@ FLV 是顺序 Tag 流：文件头之后依次出现 Script、Audio、Video Tag�
 
 ```
 
-#### FLV Header 二进制格式（9 字节）
+#### FLV Header 二进制格式（基础字段 9 字节）
 
 |偏移|大小|字段|值|说明|
 |---|---|---|---|---|
@@ -563,13 +554,13 @@ FLV 10.1 规范把组合结果定义为 `SI32`，且文件第一个 Tag 的时�
 │ 0x17 或 0x27        ← 关键帧/普通帧, H.264         │
 │ 0x01                ← AVCPacketType=1(NALU)        │
 │ 0xXX 0xXX 0xXX     ← CompositionTime=CTS          │
-│ [4B length][NALU₁] [4B length][NALU₂] ...         │
-│            ← AVCC 格式, 与 fMP4 mdat 内部相同!     │
+│ [Length][NALU₁] [Length][NALU₂] ...               │
+│ ← Length 宽度由配置指定；与 AVC sample 语法对应    │
 └────────────────────────────────────────────────────┘
 
 ```
 
-Adobe 的传统 FLV 语法允许一个 AVC Video Tag 承载一个或多个 NALU，甚至允许按独立 Slice 分包，并不强制每个 Tag 都是完整 Access Unit。很多直播系统约定“一条视频消息就是一帧”，但重封装器不能只依赖这个工程惯例：若输入按 Slice 分包，转为一个 sample 对应一个 Access Unit 的 fMP4 前，必须结合时间戳、NALU 语法和 Access Unit 边界先完成组帧。
+[Adobe FLV 规范 E.4.3.2](https://veovera.org/docs/legacy/video-file-format-v10-1-spec.pdf) 对 AVC NALU 媒体包明确要求完整帧（“Full frames are required”）：一个包可包含组成该帧的多个 NALU，不能把任意独立 Slice 分包称为合规 FLV。若需兼容这类非标准输入，应额外组帧或明确拒绝。
 
 ### 3.5 Audio Tag Data
 
@@ -579,13 +570,9 @@ Adobe 的传统 FLV 语法允许一个 AVC Video Tag 承载一个或多个 NALU�
 |AACPacketType|1B|0=SeqHeader, 1=Raw|
 |Data|变长|—|
 
-#### AACPacketType=0：AAC Sequence Header（AudioSpecificConfig）
+#### AACPacketType=0：AAC Sequence Header
 
-- 通常仅 2 字节：如 `12 10` = AAC-LC, 44100Hz, Stereo
-
-- 其内容是 `AudioSpecificConfig`，可与 MP4 `esds` 内 `DecoderSpecificInfo` 所含 ASC 对应；它**不等于整个 `esds` Box**
-
-- 没有这个 → 无声
+负载为第 2.3 节介绍的 ASC，例如 AAC-LC/44.1 kHz/双声道常见 `12 10`，但长度并不固定。接收端须先获得适用的配置，再解码 Raw AAC；不能把整个 `esds` Box 复制到此处。
 
 #### 音频帧大小
 
@@ -597,29 +584,11 @@ $$
 
 但 GA 配置可使用 960 samples，其他 AOT、SBR/PS 和多 raw data block 还会改变 core/output 采样关系，不能靠固定 23.22 ms 反推时间戳。以 128 kbit/s、1024 samples、44.1 kHz 粗略估算，编码负载平均约 372 字节/帧；瞬时帧大小仍会随码率模式和编码内容变化。
 
-### 3.6 时间戳机制
+### 3.6 时间戳与交织
 
-- 对 AVC NALU Tag，Tag Header Timestamp 用作 DTS（毫秒）；CompositionTime 再把它映射到 PTS
+AVC NALU Tag 的 Header Timestamp 为 DTS，`PTS = DTS + CompositionTime`，后者是有符号 24 bit 毫秒偏移；AAC 通常无显示重排序，可视为 `PTS=DTS`。音视频 Tag 通常大致按时间交织，但 FLV 不要求所有 Tag 全局严格按 DTS 排序。时间戳范围与回绕集中见第 8.2 节。
 
-- $PTS = DTS + CompositionTime$；该字段是有符号 24 位整数，因此 B 帧可能出现负偏移
-
-- 对通常不做显示重排序的 AAC，容器层可视为 $PTS = DTS$
-
-- 精度：毫秒级
-
-- 低 24 位约每 4.66 小时进位到 `TimestampExtended`。若按直播系统常见的无符号 32 位计数解释，一个完整周期约 49.71 天；若严格按 FLV 规范的 `SI32` 正值范围解释，约 24.86 天就到达最大正值。长直播应在输入边界做时间戳展开，并在重连、回退或配置切换处显式处理 discontinuity
-
-### 3.7 音视频排布
-
-- 文件或流通常按时间大致交织音视频 Tag，以便增量播放；FLV 结构本身不要求所有 Tag 全局严格按 DTS 排序
-
-- 音频密度更高：AAC 44.1kHz 每 23ms 一个 Tag vs 视频 30fps 每 33ms
-
-- H.264 视频流应在媒体帧前发送 AVC Sequence Header；直播服务端通常会缓存并补发
-
-- AAC 音频流应在 Raw AAC 帧前发送 AAC Sequence Header；否则中途加入可能无法立即解码
-
-### 3.8 Seek 机制
+### 3.7 Seek 与索引
 
 - `PreviousTagSizeN`：位于第 N 个 Tag 之后，值为该 Tag 的 `11 + DataSize`，不包含 `PreviousTagSize` 字段自身；`PreviousTagSize0` 紧跟 FLV Header，值为 0
 
@@ -627,17 +596,9 @@ $$
 
 - 文件 Seek 的典型流程：查关键帧索引 → 跳转到可 Seek Video Tag → 补齐/恢复 Sequence Header → 从该点继续解码。没有索引时只能扫描或由服务端维护外部索引
 
-### 3.9 FLV 的局限性
+### 3.8 Enhanced RTMP/FLV 扩展
 
-- H.265/AV1 等新编码不在 Adobe 传统 4-bit `CodecID` 定义中。Enhanced RTMP/FLV 使用扩展视频头和 FourCC 信令；厂商私有 CodecID 与该开放扩展不能混为一谈
-
-- 传统 FLV 缺少像 ISO BMFF 那样的原生标准多轨与字幕 Track 模型；多语言、多字幕通常要依赖额外协议或扩展
-
-- 时间戳精度低（毫秒 vs fMP4 可配置 timescale）
-
-- Flash 退场后地位下降，但 HTTP-FLV 仍广泛使用
-
-### 3.10 Enhanced RTMP/FLV：不是私有 CodecID 的别名
+传统 FLV 的编码标识、多轨模型与毫秒时间精度有限。新编码可通过 Enhanced RTMP/FLV 扩展承载；厂商私有 CodecID 不能视为该规范的一部分。
 
 Enhanced RTMP v2 在保留传统消息类型的基础上增加扩展音视频头。以视频为例，传统首字节是 `FrameType(4) + CodecID(4)`；扩展模式把最高位作为 `isExVideoHeader`，随后 3 bit 表示 `VideoFrameType`，低 4 bit 改解释为 `VideoPacketType`，codec 由后续 FourCC 标识。因此旧解析器若仍把低 4 bit 当 `CodecID`，会从第一个字节起就错位。
 
@@ -659,21 +620,150 @@ Enhanced RTMP/FLV 还定义标准多轨、HDR/颜色元数据和高精度时间�
 
 ---
 
-## 四、RTMP（Real-Time Messaging Protocol）格式详解
+## 四、MPEG-2 TS：固定包与节目复用
 
-### 4.1 先澄清：RTMP 不是媒体封装容器
+### 4.1 设计目标
 
-RTMP 更准确地说是**实时传输协议**，不是像 MP4、FLV、TS 那样的文件封装格式。它常与 FLV Tag 数据模型配合使用：推流端把音视频按 RTMP Message 发送，消息 payload 通常承载与 FLV Audio/Video/Script Tag Data 高度一致的数据。
+MPEG-2 TS 面向广播、复用和连续传输场景。固定 188 字节包长与同步字节便于硬件处理、在字节流中重新找到包边界；PID、连续计数器和周期性 PSI 则帮助接收端识别流、检测丢包并在后续数据处恢复。基础 TS 本身不提供前向纠错或重传，“容易检测并重新同步”不等于“不会丢包”。
 
-可以这样理解：
+ITU-T H.222.0 / ISO/IEC 13818-1 定义的核心 TS packet 是 188 字节。192B M2TS 常在前面增加 4B 到达时间信息，204B 广播包常在后面增加 16B 纠错数据，解析前需识别变体。核心包仅 4B Header 的开销为 `4/188 ≈ 2.13%`，尚未计入 PES、PSI 与 adaptation field。
 
-- **FLV**：定义文件/流里的 Tag 结构，常用于 HTTP-FLV 播放链路。
+### 4.2 核心结构
 
-- **RTMP**：定义客户端与服务器之间如何建连、握手、分块、复用和传输消息。
+```text
+[TS Packet 1 (188B)] [TS Packet 2 (188B)] [TS Packet 3 (188B)] ...
+ └── 4B Header + [Adaptation Field] + [Payload]
+     sync_byte=0x47 + PID + continuity_counter + ...
 
-- **RTMP + FLV 数据模型**：直播推流最常见组合之一，H.264/AAC 的 Sequence Header、NALU、AAC Raw 等与 FLV 章节中的描述可以对应起来。
+```
 
-### 4.2 RTMP 整体链路
+4 字节 TS Header 的位布局如下：
+
+|字段|位数|作用|
+|---|---:|---|
+|sync_byte|8|固定 `0x47`|
+|transport_error_indicator（TEI）|1|上游检测到不可纠正错误|
+|payload_unit_start_indicator（PUSI）|1|本包 payload 中存在 PSI section 或 PES packet 的起点；具体解释随 PID 类型变化|
+|transport_priority|1|同 PID 包的传输优先级提示|
+|PID|13|标识 PSI、PES 或其他数据流|
+|transport_scrambling_control|2|传输层加扰状态|
+|adaptation_field_control|2|`01`=仅 payload，`10`=仅 adaptation field，`11`=两者都有，`00` 保留|
+|continuity_counter|4|每个 PID 独立的模 16 连续计数|
+
+- PID 区分不同流。`0x0000` 固定用于 PAT，PMT PID 由 PAT 给出，音视频 PID 由 PMT 给出，`0x1FFF` 是 Null Packet
+
+- 一个视频帧可能被拆到多个 TS 包
+
+- 每个 PID 各自维护 4 bit `continuity_counter`。`adaptation_field_control=01/11`、即包内含 payload 时，对同 PID 的新包递增 1（模 16）；`10`、即仅有 adaptation field 时不递增；`00` 为保留值，接收端应丢弃。Null PID `0x1FFF` 的连续计数值未定义，不能据此报丢包
+
+- 规范允许同 PID 的原包与**一份**重复包连续出现：两包使用相同 CC，除 PCR 可更新为有效值外，其余字节相同，且二者的 adaptation control 为 `01` 或 `11`。因此 CC 重复只有在满足重复包条件时才不是错误；payload 不同却沿用同一 CC，不能被静默当成合法重传
+
+- 同 PID 的 CC 无故跳变通常表示丢包、乱序或拼接错误；`discontinuity_indicator=1` 可以显式宣布连续性/系统时基中断，但接收端仍应丢弃已残缺的 PES 或 section，并从下一个可验证边界重组。`TEI=1` 的包也应作为损坏数据丢弃或明确传播错误状态，不能继续喂给解码器
+
+- Adaptation Field 可携带 PCR、`random_access_indicator`、`discontinuity_indicator`、OPCR 和填充等信息，因此有效 payload 不一定是 184 字节。随机访问指示只是信令，接收端仍需核对编码访问单元和参数集
+
+### 4.3 PES（Packetized Elementary Stream）
+
+编码 Elementary Stream 先按 PES 组织，再切到同一 PID 的多个 TS packet 中：
+
+```text
+Elementary Stream Access Units
+  → PES Header + PES Payload
+  → TS Packet payload + TS Packet payload + ...
+```
+
+- 对承载 PES 的 PID，`PUSI=1` 表示当前 TS payload 的第一个字节就是新 PES packet 的起点；PES 路径没有 PSI 的 `pointer_field`。它不表示“这个 TS 包等于一帧”
+
+- PES Header 可以携带 PTS/DTS；并非每个 TS 包甚至并非每个 PES Header 都同时包含二者
+
+- `PTS_DTS_flags=10` 表示只带 PTS，`11` 表示同时带 PTS 和 DTS，`00` 表示两者都没有，`01` 是禁止值。DTS 不能脱离 PTS 单独出现；没有 B 帧重排时通常只需 PTS，有重排且两者不同时才同时写入
+
+- 一个 PES packet 可以包含一个或多个 Access Unit，也可能只包含某个 Access Unit 的一部分；Access Unit 边界要结合编码语法和 PES/时间戳信息判断
+
+- `PES_packet_length` 是 16 位；某些视频 PES 允许写 0 表示长度未在该字段中界定，因此不能只靠它切出所有视频 PES
+
+### 4.4 PSI 表
+
+- **PAT（PID 0）**：把 `program_number` 映射到对应 PMT PID；`program_number=0` 的条目用于 Network PID，不是普通节目
+
+- **PMT**：列出节目中的基本流 PID、`stream_type`、描述符以及 `PCR_PID`。一些私有或扩展 `stream_type` 必须结合 registration/codec descriptor 才能确定真实 codec，不能只按单个类型字节猜流内容
+
+常见 PMT `stream_type` 示例：
+
+|stream_type|典型映射|
+|---|---|
+|`0x1B`|AVC/H.264 video|
+|`0x24`|HEVC/H.265 video|
+|`0x0F`|ISO/IEC 13818-7 AAC with ADTS transport syntax|
+|`0x11`|ISO/IEC 14496-3 AAC with LATM transport syntax|
+|`0x06`|PES private data；必须结合 descriptor/注册标识继续判断|
+
+- PAT/PMT 以 section 形式承载。PUSI 为 1 时，payload 开头的 `pointer_field` 给出从它之后到第一个新 section 起点的字节数；这些字节可以是前一个跨包 section 的结尾或 stuffing，不能一律丢弃。section 可以跨多个 TS packet，单个 TS packet 也可能容纳多个 section
+
+- `version_number`、`current_next_indicator`、`section_number/last_section_number` 共同管理表版本、当前/下一版本与分节。只有收齐同一版本所需 section 并通过校验后，才能原子替换当前 Program 映射，不能收到一个新版 PMT section 就混用新旧 PID
+
+- section 末尾使用 H.222.0 Annex A 定义的 MPEG-2 CRC-32，使整个 section 通过同一 CRC 模型后的余数为 0。它的位序/初值处理不能直接套用常见“反射式 Ethernet/ZIP CRC-32”API 默认参数
+
+广播接收端可在任意时刻加入，因此 PAT/PMT 通常周期性重发。RFC 8216 对 HLS 的要求更具体：一个 TS Segment 只能包含单个 Program；每个 Segment 必须含 PAT 与 PMT，或由适用的 `EXT-X-MAP` 提供媒体初始化段。没有 `EXT-X-MAP` 时，前两个 TS packet 应当是 PAT 和 PMT。
+
+### 4.5 PCR、PTS、DTS：三种时间各管什么
+
+TS 的同步不能只看 PTS/DTS，还必须理解 PCR：
+
+|字段|典型位置|作用|时基|
+|---|---|---|---|
+|PCR（Program Clock Reference）|`PCR_PID` 的 TS Adaptation Field|让接收端恢复编码器的系统时钟，驱动去抖动与解码缓冲|33 bit base（90kHz）+ 9 bit extension（27MHz）|
+|DTS|PES Header|在系统解码模型中指定 Access Unit 的解码时刻|90kHz|
+|PTS|PES Header|指定 Access Unit 的呈现时刻，用于音视频同步|90kHz|
+
+PCR 字段实际占 6B：`base:33 + reserved:6 + extension:9`；其中 42 个有效位并非普通的二进制拼接计数：
+
+$$
+PCR_{27M} = 300 \times PCR_{base} + PCR_{ext}
+$$
+
+$$
+t_{\text{seconds}} = \frac{PCR_{27M}}{27\,000\,000}
+$$
+
+`PCR_ext` 虽占 9 bit，但合规取值范围是 0～299；与 `PCR_base` 合并后形成 27 MHz 计数。
+
+PCR 是系统时钟恢复基准，PTS/DTS 是相对于节目时间线的解码与呈现调度值。广播接收机可用 PCR 驱动 T-STD/去抖动时钟，再按 DTS 解码、按 PTS 呈现；某些文件或 HTTP 播放器会采用自己的时钟策略，但仍必须正确处理这些时间值。
+
+不要用“最近一个 PCR 就是当前视频帧 PTS”的方式配对：PCR 可以位于单独 PID，也可以与某个 PES 共用 PID，它采样的是系统时钟而非 Access Unit 呈现时间。`discontinuity_indicator` 出现在 `PCR_PID` 时还可能宣布系统时基切换；接收端必须让下一 PCR 建立新时钟段，并同步重置相关抖动/展开状态。
+
+PTS/DTS 与 `PCR_base` 都是 33 bit 循环计数；回绕周期、展开及 discontinuity 处理见第 8.2 节。
+
+### 4.6 AVC/HEVC 字节流与参数集
+
+AVC/HEVC 使用带 Start Code 的字节流表示；PES 和 TS packet 边界不保证与 NALU 或 Access Unit 边界重合。随机访问处常见如下排列：
+
+```text
+AVC： [Start Code][AUD] [Start Code][SPS] [Start Code][PPS]
+      [Start Code][IDR Slice 1] [Start Code][IDR Slice 2] ...
+HEVC：[Start Code][VPS] [Start Code][SPS] [Start Code][PPS]
+      [Start Code][IDR 或 CRA 的 Slice NALU] ...
+```
+
+在随机访问点前重复参数集便于中途加入，但不是每个 IDR 都必须重复的通用语法要求。HEVC 的 CRA/IDR 差异见第 1.4 节；`random_access_indicator` 也不能替代真实编码依赖检查。
+
+### 4.7 音频在 TS 中的携带
+
+- 传统 HLS/TS 中的 AAC 常使用 ADTS Header（`protection_absent=1`、无 CRC 时 7 字节）+ AAC 原始访问单元
+
+- ADTS 每帧携带 profile、采样率索引、声道配置和帧长等信息，比单次 ASC 更冗余但便于重新加入
+
+- MPEG-2 TS 也定义了 LATM/LOAS 等其他 AAC 映射，不能把“TS 中 AAC 必然是 ADTS”当成通用规则
+
+---
+
+## 五、RTMP：消息分块与 FLV 负载传输
+
+### 5.1 TCP 上的消息与分块传输
+
+RTMP 在 TCP 连接中复用 Command、Control、Data、Audio 和 Video Message。音视频 payload 通常复用第三章的 FLV Tag Data；RTMP 线上没有 FLV 文件头、Tag Header 和 PreviousTagSize。
+
+### 5.2 RTMP 整体链路
 
 ```text
 TCP 连接
@@ -686,9 +776,9 @@ TCP 连接
 
 ```
 
-RTMP 工作在 TCP 之上，默认端口通常是 `1935`。它的核心不是“文件结构”，而是**把不同类型的消息切成 Chunk，在一条 TCP 连接中复用传输**。
+普通 RTMP 的默认端口为 1935；消息按 Chunk 在连接中交织。
 
-### 4.3 握手格式
+### 5.3 握手格式
 
 RTMP 建连后先进行握手：
 
@@ -705,9 +795,9 @@ Client -> Server: C2
 |C1/S1|1536B|基础规范为 4B time + 4B zero + 1528B random|
 |C2/S2|1536B|对端 time、接收时刻 time2 与 1528B random echo|
 
-公开的 Adobe RTMP 1.0 规范定义的是固定长度的基础握手：C1/S1 为 `time + zero + random`，其中 4 字节 `zero` 必须为 0；C2/S2 回显对端的时间与随机区。工程中所谓带 HMAC 摘要的 “complex handshake” 来自历史实现扩展，并未写入该公开 RTMP 1.0 语法，不能在没有互操作约定时把 C1/S1 的第二个 4 字节字段擅自解释为版本号或摘要索引。普通直播链路通常由 SDK 或服务器框架封装这两条路径。
+此处为 Adobe RTMP 1.0 的基础握手。带 HMAC 的 complex handshake 属于历史实现扩展，不能与表中的 `zero` 字段语义混用。
 
-### 4.4 Chunk：RTMP 的传输基本单元
+### 5.4 Chunk：RTMP 的传输基本单元
 
 RTMP Message 可能很大，协议会把 Message 切成多个 Chunk 发送。每个 Chunk 由 Basic Header、Message Header、可选 Extended Timestamp 和 Chunk Data 组成。
 
@@ -720,11 +810,15 @@ RTMP Message 可能很大，协议会把 Message 切成多个 Chunk 发送。每
 
 #### Basic Header
 
-Basic Header 主要包含：
+首字节为 `fmt:2 + csid 编码:6`；Basic Header 共 1～3B：
 
-- **fmt**：2 bit，表示 Message Header 的压缩格式。
+|低 6 bit|额外字节|实际 CSID|
+|---|---|---|
+|2～63|无|等于该值；2 保留用于底层协议控制|
+|0|1B：b1|`64 + b1`|
+|1|2B：b1、b2|`64 + b1 + 256×b2`|
 
-- **csid**：Chunk Stream ID，用于区分不同 Chunk Stream。
+因此 CSID 扩展字节也有自己的低字节优先规则，不能把整个 RTMP 头都按大端读取。`fmt` 决定 Message Header：
 
 |fmt|Header 类型|含义|
 |---|---|---|
@@ -767,7 +861,7 @@ RTMP Header 有一个容易踩坑的点：多数多字节字段按网络序/大�
 
 Chunk Size 也按**发送方向分别维护**：默认最大 Chunk Data 为 128 字节；某端发送 `Set Chunk Size` 后，新值约束的是该端随后发出的 Chunk。它只改变分块边界，不改变 Message Length、媒体帧边界或时间戳。
 
-### 4.5 Message Type：RTMP 承载什么
+### 5.5 Message Type：RTMP 承载什么
 
 |Type ID|名称|典型内容|
 |---|---|---|
@@ -780,258 +874,406 @@ Chunk Size 也按**发送方向分别维护**：默认最大 Chunk Data 为 128 
 |0x12|Data Message AMF0|onMetaData 等 AMF0 数据消息|
 |0x14|Command Message AMF0|connect、createStream、publish、play 等 AMF0 命令|
 
-### 4.6 RTMP 与 FLV 的对应关系
+### 5.6 与 HTTP-FLV 的转换
 
-RTMP 的音视频 Message payload 与 FLV Tag Data 高度对应，但二者边界和时间戳位置不同：
+重组 RTMP Message 后，把兼容的音视频 payload 写入 FLV Tag Data，将消息 timestamp 写入 Tag Header，再补 FLV Header、PreviousTagSize 等结构即可，无需重新编码。Script/Data Message 则需按具体 AMF 语义适配，不能保证原样复制。
 
-|维度|FLV|RTMP|
-|---|---|---|
-|定位|封装格式/流格式|实时传输协议|
-|基本单元|Tag|Message，被切分成 Chunk 传输|
-|视频负载|Video Tag Data|Video Message payload，通常复用 Video Tag Data 结构|
-|音频负载|Audio Tag Data|Audio Message payload，通常复用 Audio Tag Data 结构|
-|元数据|Script Tag|Data Message，如 onMetaData|
-|时间戳|位于 FLV Tag Header|位于 RTMP Chunk Message Header；重组后属于 Message 元数据，不在音视频 payload 内|
-|传输边界|Tag Header + Tag Data + PreviousTagSize|Chunk Header + Message payload；没有 FLV Tag Header 和 PreviousTagSize|
+RTMP 的 TCP 字节流按序可靠交付，但丢包后的缺口会阻塞后续数据，可能增加延迟。浏览器播放一般需要网关转换；实际延迟还取决于编码、排队和播放缓冲，不能仅由协议名称比较。
 
-因此，RTMP 转 HTTP-FLV 通常不需要重新编码，只需要做**协议解包 + 封装重组**：重组 RTMP Message，把其音视频 payload 写入 FLV Tag Data，把 RTMP Message timestamp 映射到 FLV Tag timestamp，并补齐 FLV Header、Tag Header、PreviousTagSize 等结构。
+---
 
-### 4.7 工程特点与局限
+## 六、RTP / RTCP：媒体报文、H.264 打包与反馈
 
-- **低延迟**：长连接持续推送，通常比传统 HLS 更低延迟。
+### 6.1 在 WebRTC 中的位置
 
-- **推流生态成熟**：OBS、FFmpeg、SRS、Nginx-RTMP 等工具链长期支持。
-
-- **浏览器播放不友好**：Flash 退场后，浏览器端通常不直接播放 RTMP，需要转成 HTTP-FLV、HLS、DASH、WebRTC 等。
-
-- **基于 TCP**：应用看到的是有序、可靠字节流；网络丢包会触发重传，而前面的缺口会阻塞后续字节交付，因此弱网下可能放大延迟和抖动。
-
-- **编解码扩展依赖约定**：H.264/AAC 最常见；H.265 等通常依赖 Enhanced RTMP/Enhanced FLV 或厂商约定。
-
-## 五、TS（MPEG-2 Transport Stream）格式详解
-
-### 5.1 设计目标
-
-MPEG-2 TS 面向广播、复用和连续传输场景。固定 188 字节包长与同步字节便于硬件处理、在字节流中重新找到包边界；PID、连续计数器和周期性 PSI 则帮助接收端识别流、检测丢包并在后续数据处恢复。基础 TS 本身不提供前向纠错或重传，“容易检测并重新同步”不等于“不会丢包”。
-
-ITU-T H.222.0 / ISO/IEC 13818-1 定义的核心 TS packet 是 188 字节。工程上看到的 192 字节 M2TS 常在前面增加 4 字节到达时间戳，204 字节广播包常在后面增加 16 字节纠错数据；解析前要先识别外层变体，不能直接把它们当成 188 字节 TS 头。
-
-### 5.2 核心结构
+RTP 按编码对应的 Payload Format 携带媒体；RTCP 提供统计、时钟映射和反馈；STUN 为 ICE 提供地址发现与连通性检查。它们都不是 MP4/FLV 一类的文件容器。WebRTC 的典型 UDP 媒体路径如下：
 
 ```text
-[TS Packet 1 (188B)] [TS Packet 2 (188B)] [TS Packet 3 (188B)] ...
- └── 4B Header + [Adaptation Field] + [Payload]
-     sync_byte=0x47 + PID + continuity_counter + ...
+H.264 Access Unit → NALU → RTP packetizer → SRTP → UDP/IP
+                                      ↑
+接收质量、丢包、刷新请求 ← RTCP/SRTCP
 
+ICE：使用 STUN 检查候选地址对，必要时通过 TURN 中继
+DTLS-SRTP：协商 SRTP/SRTCP 所需密钥材料
 ```
 
-4 字节 TS Header 的位布局如下：
+媒体通常由 SRTP 保护，控制报文由 SRTCP 保护；DTLS 用于密钥协商，并不是把每个 RTP 包作为 DTLS 应用数据发送。下文展示的是 RTP/RTCP 的逻辑格式；线上密文还须按协商的保护配置处理认证信息、索引等开销。RTP/RTCP 可复用同一传输端口，WebRTC 还会与 STUN、DTLS 复用底层传输，不能简单按 UDP 端口号判定协议。参见 [RFC 8834](https://www.rfc-editor.org/rfc/rfc8834)。
 
-|字段|位数|作用|
-|---|---:|---|
-|sync_byte|8|固定 `0x47`|
-|transport_error_indicator（TEI）|1|上游检测到不可纠正错误|
-|payload_unit_start_indicator（PUSI）|1|本包 payload 中存在 PSI section 或 PES packet 的起点；具体解释随 PID 类型变化|
-|transport_priority|1|同 PID 包的传输优先级提示|
-|PID|13|标识 PSI、PES 或其他数据流|
-|transport_scrambling_control|2|传输层加扰状态|
-|adaptation_field_control|2|`01`=仅 payload，`10`=仅 adaptation field，`11`=两者都有，`00` 保留|
-|continuity_counter|4|每个 PID 独立的模 16 连续计数|
+### 6.2 RTP 固定头：最少 12 字节
 
-- PID 区分不同流。`0x0000` 固定用于 PAT，PMT PID 由 PAT 给出，音视频 PID 由 PMT 给出，`0x1FFF` 是 Null Packet
-
-- 一个视频帧可能被拆到多个 TS 包
-
-- 每个 PID 各自维护 4 bit `continuity_counter`。`adaptation_field_control=01/11`、即包内含 payload 时，对同 PID 的新包递增 1（模 16）；`10`、即仅有 adaptation field 时不递增；`00` 为保留值，接收端应丢弃。Null PID `0x1FFF` 的连续计数值未定义，不能据此报丢包
-
-- 规范允许同 PID 的原包与**一份**重复包连续出现：两包使用相同 CC，除 PCR 可更新为有效值外，其余字节相同，且二者的 adaptation control 为 `01` 或 `11`。因此 CC 重复只有在满足重复包条件时才不是错误；payload 不同却沿用同一 CC，不能被静默当成合法重传
-
-- 同 PID 的 CC 无故跳变通常表示丢包、乱序或拼接错误；`discontinuity_indicator=1` 可以显式宣布连续性/系统时基中断，但接收端仍应丢弃已残缺的 PES 或 section，并从下一个可验证边界重组。`TEI=1` 的包也应作为损坏数据丢弃或明确传播错误状态，不能继续喂给解码器
-
-- Adaptation Field 可携带 PCR、`random_access_indicator`、`discontinuity_indicator`、OPCR 和填充等信息，因此有效 payload 不一定是 184 字节。随机访问指示只是信令，接收端仍需核对编码访问单元和参数集
-
-### 5.3 PES（Packetized Elementary Stream）
-
-编码 Elementary Stream 先按 PES 组织，再切到同一 PID 的多个 TS packet 中：
+以下多字节整数均采用网络字节序（大端）。每行共 32 bit：
 
 ```text
-Elementary Stream Access Units
-  → PES Header + PES Payload
-  → TS Packet payload + TS Packet payload + ...
+| V:2 | P:1 | X:1 | CC:4 | M:1 | PT:7 | Sequence Number:16 |
+|                       Timestamp:32                      |
+|                          SSRC:32                        |
+|                    CSRC:32 × CC（可选）                 |
+|                    Header Extension（X=1）               |
+|                    Codec-specific Payload               |
+|                    Padding（P=1）                       |
 ```
 
-- 对承载 PES 的 PID，`PUSI=1` 表示当前 TS payload 的第一个字节就是新 PES packet 的起点；PES 路径没有 PSI 的 `pointer_field`。它不表示“这个 TS 包等于一帧”
-
-- PES Header 可以携带 PTS/DTS；并非每个 TS 包甚至并非每个 PES Header 都同时包含二者
-
-- `PTS_DTS_flags=10` 表示只带 PTS，`11` 表示同时带 PTS 和 DTS，`00` 表示两者都没有，`01` 是禁止值。DTS 不能脱离 PTS 单独出现；没有 B 帧重排时通常只需 PTS，有重排且两者不同时才同时写入
-
-- 一个 PES packet 可以包含一个或多个 Access Unit，也可能只包含某个 Access Unit 的一部分；Access Unit 边界要结合编码语法和 PES/时间戳信息判断
-
-- `PES_packet_length` 是 16 位；某些视频 PES 允许写 0 表示长度未在该字段中界定，因此不能只靠它切出所有视频 PES
-
-### 5.4 PSI 表
-
-- **PAT（PID 0）**：把 `program_number` 映射到对应 PMT PID；`program_number=0` 的条目用于 Network PID，不是普通节目
-
-- **PMT**：列出节目中的基本流 PID、`stream_type`、描述符以及 `PCR_PID`。一些私有或扩展 `stream_type` 必须结合 registration/codec descriptor 才能确定真实 codec，不能只按单个类型字节猜流内容
-
-常见 PMT `stream_type` 示例：
-
-|stream_type|典型映射|
+|字段|含义|
 |---|---|
-|`0x1B`|AVC/H.264 video|
-|`0x24`|HEVC/H.265 video|
-|`0x0F`|ISO/IEC 13818-7 AAC with ADTS transport syntax|
-|`0x11`|ISO/IEC 14496-3 AAC with LATM transport syntax|
-|`0x06`|PES private data；必须结合 descriptor/注册标识继续判断|
+|V|版本，当前格式为 2|
+|P|末尾存在 RTP padding；最后 1 字节给出 padding 总字节数，包含该计数字节|
+|X|CSRC 列表后存在扩展头|
+|CC|CSRC 个数，0～15；每个 CSRC 为 4 字节|
+|M|Marker，语义由负载格式定义；H.264 表示 Access Unit 的最后一个 RTP 包|
+|PT|7 bit Payload Type，通过 SDP 映射到编码及其时钟频率；不是 NALU Type|
+|Sequence Number|16 bit，每发送一个原始 RTP 数据包递增 1，用于检测丢失、乱序和重复，按模 65536 回绕|
+|Timestamp|32 bit 媒体采样时间；时钟频率由负载格式决定，不是发送时刻或 Unix 时间|
+|SSRC|32 bit 同步源标识；不同源独立维护序号和媒体时间线|
+|CSRC|混音等场景下的贡献源列表，不是每条轨道都必带|
 
-- PAT/PMT 以 section 形式承载。PUSI 为 1 时，payload 开头的 `pointer_field` 给出从它之后到第一个新 section 起点的字节数；这些字节可以是前一个跨包 section 的结尾或 stuffing，不能一律丢弃。section 可以跨多个 TS packet，单个 TS packet 也可能容纳多个 section
+RTP 头长度为 `12 + 4×CC + 扩展头长度`。解析前必须逐段检查剩余字节，不能固定跳过 12 字节就当成媒体负载。P=1 时还要从尾部扣除合法的 padding；受保护的报文应先经过对应的安全处理。格式依据 [RFC 3550 §5.1](https://www.rfc-editor.org/rfc/rfc3550#section-5.1)。
 
-- `version_number`、`current_next_indicator`、`section_number/last_section_number` 共同管理表版本、当前/下一版本与分节。只有收齐同一版本所需 section 并通过校验后，才能原子替换当前 Program 映射，不能收到一个新版 PMT section 就混用新旧 PID
+**示例：单包承载一个 IDR NALU，并且它恰好结束该 Access Unit：**
 
-- section 末尾使用 H.222.0 Annex A 定义的 MPEG-2 CRC-32，使整个 section 通过同一 CRC 模型后的余数为 0。它的位序/初值处理不能直接套用常见“反射式 Ethernet/ZIP CRC-32”API 默认参数
+```text
+80 E0 12 34  00 01 5F 90  11 22 33 44  65 [NALU 剩余字节]
+│  │  └─ seq=0x1234       └─ SSRC=0x11223344
+│  └─ M=1, PT=96
+└─ V=2, P=0, X=0, CC=0
+Timestamp=0x00015F90=90000；Payload 首字节 0x65 为 H.264 NAL Header
+```
 
-广播接收端可在任意时刻加入，因此 PAT/PMT 通常周期性重发。RFC 8216 对 HLS 的要求更具体：一个 TS Segment 只能包含单个 Program；每个 Segment 必须含 PAT 与 PMT，或由适用的 `EXT-X-MAP` 提供媒体初始化段。没有 `EXT-X-MAP` 时，前两个 TS packet 应当是 PAT 和 PMT。
+此例假定 SDP 将 PT=96 映射为 H.264/90000；96 本身不具有固定的 H.264 含义。90000 代表相对媒体时钟的一秒刻度，但初始时间戳通常是随机偏移，不能据此推断“会话已开始一秒”。
 
-### 5.5 PCR、PTS、DTS：三种时间各管什么
+### 6.3 RTP 扩展头与时间线
 
-TS 的同步不能只看 PTS/DTS，还必须理解 PCR：
+X=1 时，CSRC 列表后接以下结构：
 
-|字段|典型位置|作用|时基|
+```text
+| Profile / Extension Identifier:16 | Length:16 |
+| Extension Data：Length × 4 字节，包含对齐填充    |
+```
+
+这里 Length 以 **32 bit word** 为单位，不包含扩展头自身的 4 字节。扩展数据末尾对齐填充与 P 位指示的 RTP 尾部 padding 是两个独立概念。
+
+[RFC 8285](https://www.rfc-editor.org/rfc/rfc8285) 定义的常用元素格式：
+
+|形式|扩展标识|元素头|元素数据长度|
 |---|---|---|---|
-|PCR（Program Clock Reference）|`PCR_PID` 的 TS Adaptation Field|让接收端恢复编码器的系统时钟，驱动去抖动与解码缓冲|33 bit base（90kHz）+ 9 bit extension（27MHz）|
-|DTS|PES Header|指定 Access Unit 进入解码器的时刻；有重排序且 PTS 与 DTS 不同时需要|90kHz|
-|PTS|PES Header|指定 Access Unit 的呈现时刻，用于音视频同步|90kHz|
+|One-byte|`0xBEDE`|`ID:4 + len:4`|`len+1`，即 1～16 字节；ID=0 用于 padding；遇 ID=15 时停止解析本扩展区|
+|Two-byte|`0x1000～0x100F`，低 4 bit 为 appbits|`ID:8 + len:8`|len 字节，可为 0；ID=0 是单字节 padding|
 
-PCR 的 42 位值由两部分组成：
+MID、音频电平和用于传输反馈的序号等可通过扩展携带；元素 ID 必须按 SDP `a=extmap` 解释，不能写死“ID=3 永远是某字段”。
 
-$$
-PCR_{27M} = 300 \times PCR_{base} + PCR_{ext}
-$$
+H.264 使用 90 kHz RTP 时钟，同一 Access Unit 的所有包使用相同 Timestamp；恒定 30 fps 时相邻图像通常相差 3000。音频使用各自编码规定的时钟频率，不能直接比较音频和视频的 Timestamp。RTP 时间戳不直接携带 DTS；含重排序的视频也不能把包序号或时间戳当成容器 DTS。
 
-$$
-t_{\text{seconds}} = \frac{PCR_{27M}}{27\,000\,000}
-$$
+### 6.4 WebRTC 中 H.264 NALU 的 RTP 打包
 
-`PCR_ext` 虽占 9 bit，但合规取值范围是 0～299；与 `PCR_base` 合并后形成 27 MHz 计数。
+#### 6.4.1 先确定编码和 packetization-mode
 
-PCR 是系统时钟恢复基准，PTS/DTS 是相对于节目时间线的解码与呈现调度值。广播接收机可用 PCR 驱动 T-STD/去抖动时钟，再按 DTS 解码、按 PTS 呈现；某些文件或 HTTP 播放器会采用自己的时钟策略，但仍必须正确处理这些时间值。
-
-不要用“最近一个 PCR 就是当前视频帧 PTS”的方式配对：PCR 可以位于单独 PID，也可以与某个 PES 共用 PID，它采样的是系统时钟而非 Access Unit 呈现时间。`discontinuity_indicator` 出现在 `PCR_PID` 时还可能宣布系统时基切换；接收端必须让下一 PCR 建立新时钟段，并同步重置相关抖动/展开状态。
-
-PTS/DTS 和 `PCR_base` 都是 33 bit 循环计数。90 kHz 下完整周期为：
-
-$$
-\frac{2^{33}}{90000} \approx 95\,443.72\ \text{s} \approx 26.51\ \text{h}
-$$
-
-跨回绕点比较时要先做模数展开；遇到 `discontinuity_indicator` 或 Playlist 的 `EXT-X-DISCONTINUITY` 时，还要重建时间线，不能把它误判成普通回绕。
-
-### 5.6 AVC/HEVC 参数集在 TS 中的携带方式：Annex B 内联
-
-TS 中 AVC 视频通常按 H.264 byte stream format（工程中常称 Annex B）承载，以 Start Code 分隔 NALU。PES 和 TS packet 边界都不保证与 NALU 或 Access Unit 边界重合。
-
-**一种常见的随机访问 Access Unit 组织方式：**
+“NALU 在 RTP 中怎么打包”取决于编码。以下详细说明 **H.264 / RFC 6184**，不能直接套用于 H.265，也不能套用于 VP8、VP9 或 AV1。WebRTC 的 H.264 实现必须支持 `packetization-mode=1`，其他模式可协商使用，见 [RFC 7742 §6.2](https://www.rfc-editor.org/rfc/rfc7742#section-6.2)。
 
 ```text
-[00 00 00 01] [AUD]            ← 帧边界
-[00 00 00 01] [SPS: 67 ...]   ← 在随机访问/分段边界重复
-[00 00 00 01] [PPS: 68 ...]   ← 在随机访问/分段边界重复
-[00 00 00 01] [IDR: 65 ...]   ← 关键帧
-
+a=rtpmap:96 H264/90000
+a=fmtp:96 packetization-mode=1;profile-level-id=42e01f;level-asymmetry-allowed=1
 ```
 
-**非关键帧：**
+这只是相关 SDP 行示例，不是完整 SDP。`packetization-mode` 未提供时默认是 0，不能因为“这是 WebRTC”就默认为 1。
+
+|模式|名称|允许的主要 RTP payload 结构|
+|---|---|---|
+|0|Single NAL Unit Mode|Single NALU；不能使用 STAP-A 或 FU-A|
+|1|Non-interleaved Mode|Single NALU、STAP-A、FU-A；按 NALU 解码顺序发送|
+|2|Interleaved Mode|STAP-B、MTAP16/24、FU-A/FU-B 等，涉及 DON；不是常见 WebRTC H.264 路径|
+
+RTP payload **不携带 Annex B Start Code，也不直接沿用 MP4/FLV 的长度前缀**。先从源样本提取 NALU，再按协商模式打包；NALU 内部的 EBSP 字节（包括 `emulation_prevention_three_byte`，即防止伪 Start Code 的 `03`）保持不变。
+
+#### 6.4.2 Single NALU：一个包放一个完整 NALU
+
+当一个 NALU 能放入负载预算时：
 
 ```text
-[00 00 00 01] [Non-IDR: 41/61 ...]
-
+[RTP Header][NAL Header:1B][NAL Body]
+             F:1 | NRI:2 | Type:5
 ```
 
-在每个 IDR 或 Segment 边界前重复 SPS/PPS 是常见且有利于随机加入的 muxing 策略，但不是“所有 TS 必须在每个 IDR 前重复”的语法定律。能否从某处独立开始播放，还取决于 PAT/PMT、正确的随机访问点、参数集及音频配置是否可获得。fMP4 的参数集通常来自初始化段，FLV 通常来自 Sequence Header；编码配置发生变化或新会话加入时，这些初始化信息也可能重发，而不是整个流永远只发一次。
-
-HEVC 的 TS 字节流也使用 Start Code，但随机访问 Access Unit 前常见的是 VPS/SPS/PPS 加 IDR 或 CRA：
+第一个 payload 字节就是原始 NAL Header，Type 为 1～23 范围内的适用 NALU 类型。包里不再额外写 NALU 长度，因为剩余 payload 边界已由 RTP 包确定。
 
 ```text
-[00 00 00 01] [VPS type 32]
-[00 00 00 01] [SPS type 33]
-[00 00 00 01] [PPS type 34]
-[00 00 00 01] [IDR type 19/20 或 CRA type 21]
+Annex B 输入：00 00 00 01 65 AA BB CC
+RTP payload：            65 AA BB CC
 ```
 
-CRA 与 IDR 的 leading-picture 语义不同，不能看到 HEVC `nal_unit_type=21` 就照搬 AVC IDR 的独立性标记。TS `random_access_indicator=1` 也只是说明当前位置存在随机访问信息的传输层提示；真正声明 HLS 全部分段独立的是清单的 `EXT-X-INDEPENDENT-SEGMENTS`，它要求各 Media Segment 的 sample 不依赖其他 Segment。编码依赖、参数集、容器标志与清单声明必须一致。
+即使使用 Single NALU，也不意味着“一个 RTP 包就是一帧”：一个 Access Unit 可以包含多个 Slice NALU，它们可分别占包。M 只应在整个 Access Unit 的最后一个包置 1。
 
-### 5.7 音频在 TS 中的携带
+#### 6.4.3 STAP-A：多个小 NALU 聚合进一个包
 
-- 传统 HLS/TS 中的 AAC 常使用 ADTS Header（`protection_absent=1`、无 CRC 时 7 字节）+ AAC 原始访问单元
+STAP-A 的外层 Type=24，不是编码器输出的 Slice 类型。格式为：
 
-- ADTS 每帧携带 profile、采样率索引、声道配置和帧长等信息，比单次 ASC 更冗余但便于重新加入
+```text
+[RTP Header]
+[STAP-A Header:1B = F:1 | NRI:2 | Type=24:5]
+[NALU 1 Size:2B][完整 NALU 1]
+[NALU 2 Size:2B][完整 NALU 2]
+...
+```
 
-- MPEG-2 TS 也定义了 LATM/LOAS 等其他 AAC 映射，不能把“TS 中 AAC 必然是 ADTS”当成通用规则
+每个 Size 是大端 16 bit，包含该 NALU 自己的 1B Header，不包括 Size 字段。外层 NRI 取内部 NALU 的最大 NRI；F 为内部 F 的逻辑或，正常无错误码流为 0。STAP-A 内 NALU 共享同一个 RTP 时间戳，常用于聚合较小的参数集，不能把不同采样时间的图像任意塞入同一 STAP-A。
 
-### 5.8 特点
+```text
+78 00 04 67 AA BB CC 00 03 68 DD EE
+│  │     └─4B NALU  └─3B  └─PPS Header
+│  └─第一个 Size=4
+└─F=0, NRI=3, Type=24
+```
 
-- **优势：**固定包长、容易重新同步、能检测连续性错误、广播硬件与标准生态成熟
+以上只演示字节边界，SPS/PPS body 是占位字节，不是可解码参数集。接收端拆出 `67 AA BB CC` 和 `68 DD EE`；STAP-A 的外层 Header 和两个 Size 不送入视频解码器。若后面还有同一 Access Unit 的 Slice 包，此聚合包 M=0。
 
-- **边界：**基础 TS 不自带重传或 FEC；固定 188 字节包会带来额外开销（仅 4B TS Header 占 $4/188 \approx 2.13\%$，若包含 adaptation field、PAT/PMT 重复和 PES Header，实际开销更高）；随机访问通常依赖节目指南、HLS Playlist、外部索引或接收端扫描
+#### 6.4.4 FU-A：一个大 NALU 拆成多个 RTP 包
 
-- **适用性：**在广播、传统 HLS 和既有硬件链路中仍很重要；在许多 HTTP 自适应点播和低延迟流媒体系统中，则常选择 CMAF/fMP4
+FU-A 的负载头为 2 字节：
+
+```text
+[RTP Header][FU Indicator:1B][FU Header:1B][NAL Body Fragment]
+
+FU Indicator：F:1 | NRI:2 | Type=28:5
+FU Header：   S:1 | E:1 | R:1 | Original NAL Type:5
+```
+
+S=1 表示 NALU 的起始分片，E=1 表示结束分片，R 发送时置 0。S 与 E 不可同时为 1；能放入单包时直接采用 Single NALU。原始 NAL Header 被拆分表示在这两个字段中，**不能再次作为首分片数据写入**。规则见 [RFC 6184 §5.8](https://www.rfc-editor.org/rfc/rfc6184#section-5.8)。
+
+假设原始 NAL Header 为 `0x65`（F=0、NRI=3、Type=5），分成三包：
+
+```text
+原始 NALU：65 [A][B][C]
+
+seq=1000, timestamp=T, M=0：7C 85 [A]  ← S=1,E=0,Type=5
+seq=1001, timestamp=T, M=0：7C 05 [B]  ← S=0,E=0,Type=5
+seq=1002, timestamp=T, M=1：7C 45 [C]  ← S=0,E=1,Type=5
+
+恢复 Header：(0x7C & 0xE0) | (0x85 & 0x1F) = 0x65
+恢复 NALU： 65 [A][B][C]
+```
+
+这里假定该 NALU 是 Access Unit 的最后一个 NALU；如果后面还有同一图像的其他 Slice，则第三包虽 E=1，仍必须 M=0。**E 标识 NALU 结束，M 标识 Access Unit 结束。**同一 NALU 的分片共享时间戳，按连续 RTP 序号发送；网络到达顺序则可能乱序。
+
+#### 6.4.5 MTU 预算、重组与丢包
+
+设 RTP payload 预算为 B，FU-A 每包最多携带 `B−2` 字节原始 NAL Body。若完整 NALU 长度为 N（包含 1B Header），分片数量为：
+
+```text
+ceil((N − 1) / (B − 2))
+```
+
+例如预算 B=1200B、原始 NALU=3001B，3000B Body 拆成 `1198 + 1198 + 604`；三个 RTP payload 分别为 `1200、1200、606B`。若 RTP 头均为 12B，则保护前 RTP 包分别为 `1212、1212、618B`。
+
+1200B 只是此处设定的 **payload 预算**，不是协议固定值。真实预算应从路径 MTU 扣掉 IP、UDP、RTP 固定头、CSRC、扩展头以及 SRTP 和可能的中继/隧道开销。不要把“UDP 数据报大小”“RTP 包大小”和“媒体片段大小”混作同一值。
+
+接收路径通常为：
+
+```text
+SRTP 校验/解密 → 按 SSRC 与序号缓存、去重、处理乱序
+ → 按 payload 首字节 Type 选择 Single / STAP-A / FU-A
+ → 验证长度或分片连续性，重组 NALU
+ → 按时间戳、M 和编码语法组装 Access Unit
+ → 结合参数集和播放截止时间送入解码器
+```
+
+遇到 FU-A 缺片，不能把前后残片直接拼成一个“完整 NALU”。应等待截止时间内的恢复，或按损坏处理策略丢弃该 NALU；必要时通过 PLI 请求恢复画面。M=1 不能证明此前的包均已收到；[RFC 6184 §5.1](https://www.rfc-editor.org/rfc/rfc6184#section-5.1) 也要求解码端不能只依赖 M 判断 AU 边界，应结合时间戳和编码语法。序号要展开并区分重复、乱序和源重启；RTX 包还需按协商的映射恢复原序号及媒体流归属后参与重组。
+
+#### 6.4.6 参数集与 HEVC 边界
+
+WebRTC H.264 要求通过 in-band 方式发送参数集，因此 SPS/PPS 可以通过 Single NALU 或 STAP-A 发送；生成的 SDP 不应包含 `sprop-parameter-sets`，参见 [RFC 7742 §6.2](https://www.rfc-editor.org/rfc/rfc7742#section-6.2)。它们需要在引用这些参数集的图像解码前到达；不能把 FLV AVC Sequence Header 或整个 `avcC` Box 当作 RTP 媒体 payload 原样发送。
+
+向容器转换时须先恢复完整 NALU 与 Access Unit，再建立 sample 和时间线，具体映射见第 8.3、8.5 节。
+
+HEVC/H.265 有独立的 [RFC 7798](https://www.rfc-editor.org/rfc/rfc7798)：NAL Header 为 2B，聚合 AP 使用 Type=48，分片 FU 使用 Type=49，且在适用配置下涉及 DONL 等字段。不能用 H.264 的 Type=24/28 或 `0x65 → 0x7C` 规则解析 HEVC；是否能在具体 WebRTC 会话使用 HEVC，还取决于双方能力与 SDP 协商。
+
+### 6.5 RTCP 通用头与 SR / RR
+
+RTCP 通用头为 4 字节，不能按 RTP 的 12 字节固定头解析：
+
+```text
+| V:2 | P:1 | Count / FMT:5 | Packet Type:8 | Length:16 |
+|                  Packet-specific Body               |
+```
+
+`Length = 本 RTCP 包总字节数 / 4 - 1`，包括通用头和本包 padding；它不是字节数，也不是整个 compound RTCP 的长度。Count 在 SR/RR 中为 report block 数，在反馈包中为 FMT。常见 Packet Type：
+
+|PT|名称|主体结构 / 用途|
+|---|---|---|
+|200|SR，Sender Report|发送者 SSRC + 20B Sender Info + 0～31 个 24B Report Block|
+|201|RR，Receiver Report|报告者 SSRC + 0～31 个 24B Report Block|
+|202|SDES|源描述 chunk，如 CNAME，用于源关联|
+|203|BYE|离开会话的源列表，可带原因|
+|204|APP|应用自定义内容|
+|205|RTPFB|传输层反馈，例如 Generic NACK|
+|206|PSFB|负载相关反馈，例如 PLI|
+
+无 padding、无额外 profile 扩展时，SR 总长为 `28 + 24×RC`，RR 为 `8 + 24×RC`。SR 通用头之后的主体如下（Sender Info 为其中 NTP 至 Octet Count 的 20B）：
+
+```text
+Sender SSRC:32
+NTP Timestamp:64          ← 同一时刻的墙钟表示
+RTP Timestamp:32          ← 该时刻对应的媒体时钟
+Sender's Packet Count:32
+Sender's Octet Count:32   ← RTP payload 字节累计，不含 RTP 头和 padding
+[Report Block × RC]
+```
+
+每个 24 字节 Report Block：
+
+```text
+|                  被报告的源 SSRC:32                    |
+| Fraction Lost:8 | Cumulative Packets Lost:24（有符号） |
+|          Extended Highest Sequence Number:32          |
+|                 Interarrival Jitter:32                |
+|                         LSR:32                        |
+|                        DLSR:32                        |
+```
+
+Fraction Lost 表达上次报告以来的丢包比例，单位为 1/256；累计丢包数是有符号值，重复包可能使它为负。Jitter 使用该 RTP 流的时间戳单位。LSR 是最近收到 SR 的 NTP 时间戳中间 32 bit；DLSR 是从收到该 SR 到发送此报告的间隔，单位为 1/65536 秒。发送方在收到反馈时，用同样的短 NTP 表示计算 `RTT ≈ A − LSR − DLSR`，须处理回绕和没有有效 SR 的情况。
+
+音视频同步需要各流 SR 中的 NTP↔RTP 映射，并结合源关联信息把不同媒体时钟对齐；不能只比较 RTP Timestamp。SR/RR 格式与统计定义见 [RFC 3550 §6.4](https://www.rfc-editor.org/rfc/rfc3550#section-6.4)。
+
+### 6.6 NACK、PLI 与复合 RTCP
+
+反馈报文的公共结构来自 [RFC 4585](https://www.rfc-editor.org/rfc/rfc4585)：
+
+```text
+[RTCP Header：FMT + PT + Length]
+[Sender SSRC:32]
+[Media Source SSRC:32]
+[Feedback Control Information（FCI）]
+```
+
+- **Generic NACK：PT=205，FMT=1。**每个 FCI 项为 `PID:16 + BLP:16`。PID 指出一个丢失序号，BLP 的 bit i 指出 `PID+i+1` 是否也丢失，序号按 16 bit 回绕；bit=0 并不保证对应包已经收到。
+- **PLI：PT=206，FMT=1。**FCI 为空，总长 12B，Length=2。它告知发送者图像依赖可能损坏，请求恢复可解码画面；不指定某个丢失包，也不强制发送端每次立即产生 IDR。
+
+```text
+81 CD 00 03  11 22 33 44  AA BB CC DD  12 34 00 05
+   PT=205    Sender SSRC  Media SSRC   PID   BLP
+FMT=1, Length=3 → 16B；请求序号 0x1234、0x1235、0x1237
+
+81 CE 00 02  11 22 33 44  AA BB CC DD
+   PT=206    Sender SSRC  Media SSRC
+FMT=1, Length=2 → 12B；PLI，无 FCI
+```
+
+基础 RTCP 常将多个包串成一个 compound，例如 `[SR][SDES]`；解析器应按每个包自身 Length 前进。支持并协商 reduced-size RTCP 时，某些反馈可以单独发送，不应把“所有 RTCP 数据报都必须以 SR/RR 开头”作为 WebRTC 的绝对判定规则。NACK 是反馈，是否重传及采用何种 RTX 映射还由协商和发送端策略决定；RTP 本身不提供可靠交付保证。
 
 ---
 
-## 六、四类格式/协议对比总结
+## 七、STUN：报文格式与 ICE 连通性检查
 
-|维度|fMP4|FLV|RTMP|TS|
-|---|---|---|---|---|
-|定位|分片封装格式|封装/流格式|实时传输协议|传输流封装|
-|基本结构|Box 嵌套 + Movie Fragment|顺序 Tag 流|Message 切为 Chunk 复用|固定 188B packet|
-|音视频排布|可分轨，片段化组织|按 DTS 交织|多消息流复用|按 PID 复用交织|
-|NALU 表示|AVC/HEVC 通常为长度前缀|传统 FLV 仅 AVC；Enhanced 可承载 HEVC 等，NALU codec 通常仍为长度前缀|通常复用 legacy/Enhanced FLV Video Message payload|AVC/HEVC 通常为 Annex B/byte stream Start Code|
-|初始化信息|Init Segment 中的 Sample Entry/配置 Box|Legacy AVC/AAC 或 Enhanced FourCC Sequence Header|Video/Audio Message 中的 Sequence Header|PAT/PMT + in-band 参数集/音频头|
-|时间戳机制|tfdt + sample duration + CTO；可选 prft 映射墙钟|Tag Header Timestamp + CompositionTime|RTMP Message Timestamp / Delta|PCR 恢复时钟，PES PTS/DTS 调度呈现与解码|
-|媒体时间精度|Track timescale 可配置|毫秒|常见媒体消息为毫秒|PTS/DTS 为 90 kHz，PCR 为 27 MHz|
-|Seek 支持|清单、sidx/mfra、Byte Range 或应用索引|keyframes 元数据 + fileposition|协议本身不负责文件 Seek，播放侧通过命令和服务端状态实现|通常依赖外部 Playlist/索引|
-|典型场景|DASH/HLS/CMAF|HTTP-FLV|直播推流、传统直播拉流|广播/传统 HLS|
-|延迟属性|由分片/Chunk、GOP、清单、传输和播放器缓冲决定|由 GOP、服务端与播放器缓冲、网络决定|由 GOP、Chunk、TCP 与收发缓冲决定|由分段、缓冲、传输系统与播放器策略决定|
+### 7.1 固定头：20 字节
+
+STUN 是请求/响应及指示消息协议，核心格式由 [RFC 8489 §5](https://www.rfc-editor.org/rfc/rfc8489#section-5) 定义：
+
+```text
+| 0:2 |       Message Type:14       | Message Length:16 |
+|                 Magic Cookie:32 = 0x2112A442           |
+|                                                       |
+|                   Transaction ID:96                   |
+|                                                       |
+|               Attributes：TLV 序列，4 字节对齐          |
+```
+
+|字段|规则|
+|---|---|
+|Message Type|最高 2 bit 固定为 0；其余位交织编码 Method 与 Class|
+|Message Length|头后属性区字节数，包含属性 padding，不包含 20B 固定头；必须为 4 的倍数|
+|Magic Cookie|固定 `21 12 A4 42`，用于识别报文及 XOR 地址计算|
+|Transaction ID|96 bit 事务标识；响应匹配请求，同一事务重传保持此标识|
+
+Type 的布局从最高位到最低位为：
+
+```text
+0 0 M11 M10 M9 C1 M8 M7 M6 C0 M5 M4 M3 M2 M1 M0
+
+Class C1C0：00=Request，01=Indication，10=Success，11=Error
+Binding Method=0x001：
+  Request=0x0001   Indication=0x0011
+  Success=0x0101   Error=0x0111
+```
+
+因此 Type 不能按“高字节是方法、低字节是类型”拆开。仅凭最高两位是 0 也不足以证明是合法 STUN，还要核验 Cookie、长度、事务上下文与相应认证。
+
+### 7.2 Attribute：TLV 与 padding
+
+```text
+| Attribute Type:16 | Attribute Length:16 |
+| Value：Attribute Length 字节            |
+| Padding：0～3 字节，对齐到 4B            |
+```
+
+Attribute Length 只计算 Value，不包括 4B TLV 头，也不包括 padding。下一个属性偏移为 `当前偏移 + 4 + ((Length+3) & ~3)`。例如 5B Value 的属性实际占 12B：4B 头 + 5B 值 + 3B padding。
+
+Type `0x0000～0x7FFF` 属于 comprehension-required，未知时按消息处理规则处理，不能一律忽略；`0x8000～0xFFFF` 属于 comprehension-optional。常见属性如下：
+
+|Type|属性|Value 格式 / 用途|
+|---|---|---|
+|0x0006|USERNAME|变长用户名；ICE 检查中使用 ufrag 组合|
+|0x0008|MESSAGE-INTEGRITY|20B HMAC-SHA1，证明持有共享凭据|
+|0x0009|ERROR-CODE|前 4B 为保留位、Class 和 Number，后接原因文本；错误码为 `Class×100+Number`|
+|0x0014 / 0x0015|REALM / NONCE|长期凭据认证使用的域与挑战值|
+|0x001C|MESSAGE-INTEGRITY-SHA256|HMAC-SHA256；按适用规则允许截断，不应总按 32B 固定解析|
+|0x0020|XOR-MAPPED-ADDRESS|响应中报告观察到的源 IP/端口|
+|0x0024|PRIORITY|4B，若产生 peer-reflexive candidate 时赋给它的优先级|
+|0x0025|USE-CANDIDATE|0B，ICE controlling 端用于提名候选地址对|
+|0x8028|FINGERPRINT|4B，CRC-32 与 `0x5354554E` 异或|
+|0x8029 / 0x802A|ICE-CONTROLLED / ICE-CONTROLLING|8B tie-breaker，声明 ICE 角色并处理角色冲突|
+
+MESSAGE-INTEGRITY 与 FINGERPRINT 的覆盖范围不同：前者计算 HMAC 时覆盖该属性之前的消息字节，并将头部 Message Length 临时调整到该完整性属性末尾；不把该属性本身纳入 HMAC 输入。FINGERPRINT 必须位于最后，CRC 覆盖它之前的消息字节，头部 Length 则包含 FINGERPRINT。FINGERPRINT 不是密码学认证；XOR 地址编码也不是加密。完整性计算的细节见 [RFC 8489 §14.5～14.7](https://www.rfc-editor.org/rfc/rfc8489#section-14.5)。
+
+### 7.3 XOR-MAPPED-ADDRESS 的位布局与实例
+
+```text
+| Reserved:8=0 | Family:8 | X-Port:16 |
+| X-Address：IPv4 为 32 bit，IPv6 为 128 bit |
+```
+
+- Family=1：IPv4；`Port = X-Port XOR 0x2112`，`IPv4 = X-Address XOR 0x2112A442`。
+- Family=2：IPv6；端口规则相同，地址与 `Magic Cookie || Transaction ID` 拼成的 128 bit 掩码异或。
+- IPv4 属性 Value 长 8B、整个 TLV 长 12B；IPv6 分别为 20B 和 24B。
+
+以下是仅含一个地址属性的 Binding Success 格式示例，**省略认证属性，不是完整 ICE 成功响应**：
+
+```text
+01 01 00 0C  21 12 A4 42  01 02 03 04 05 06 07 08 09 0A 0B 0C
+└─Success    └─Cookie      └─Transaction ID（12B）
+      └─Message Length=12B；整个消息=32B
+
+00 20 00 08  00 01 F5 23  EA 12 D5 45
+Type  Len    IPv4 X-Port   X-Address
+
+0xF523 XOR 0x2112 = 0xD431 = 54321
+EA 12 D5 45 XOR 21 12 A4 42 = CB 00 71 07 = 203.0.113.7
+```
+
+这里报告的是服务端从该事务观察到的源地址 `203.0.113.7:54321`，并不保证其他对端使用这个地址就一定能穿透 NAT。
+
+### 7.4 STUN、ICE、TURN 的分工
+
+ICE 将本地、server-reflexive 和 relayed 等候选地址配对，通过 STUN Binding 请求验证真实路径，并提名使用的候选地址对。向 STUN 服务端查询映射地址，与向对端执行 ICE connectivity check，虽然都用 Binding，但事务对象、属性与认证上下文不同。
+
+ICE 检查的 USERNAME 通常为 `接收方 ufrag:发送方 ufrag`，请求完整性校验使用接收方的 ICE password；这些凭据由信令交换，不是用户登录密码。PRIORITY、角色属性和 USE-CANDIDATE 也属于 ICE 对 STUN 的具体用法，不能要求所有普通 STUN Binding 请求都携带它们。参见 [RFC 8445](https://www.rfc-editor.org/rfc/rfc8445)。
+
+STUN 不转发媒体。直连不可用时，TURN 提供中继；ICE 负责候选检查与选择，而 SRTP/SRTCP 负责选定路径上的媒体保护。连通性检查成功也不代表解码器已经获得 SPS/PPS 或可解码图像，这些仍属于媒体链路。
 
 ---
 
-## 七、直播传输链路与格式转换原理
+## 八、格式转换：边界、配置与时间线
 
-### 7.1 从采集到播放：每一层做什么
+### 8.1 先判断重封装还是转码
 
 ```text
-Camera / Microphone
-  ↓ raw video / PCM
-Encoder
-  ↓ H.264/HEVC Access Units + AAC Access Units + DTS/PTS
-Muxer / Packager
-  ├─ FLV Tag / RTMP Message
-  ├─ fMP4 Init + Fragments
-  └─ PAT/PMT + PES + TS packets
-Transport / Delivery
-  ├─ RTMP over TCP
-  ├─ HTTP-FLV
-  ├─ HLS/DASH over HTTP
-  └─ UDP/RTP/SRT 等承载 TS
-Player
-  ↓ demux → decode → synchronize → render
+采集 → 编码访问单元 + 时间信息
+        ├─ fMP4 / FLV / TS 封装 → HTTP / RTMP / SRT 等交付
+        └─ 编码专用 RTP 打包 → SRTP → WebRTC 接收端
+接收 → 解复用或 RTP 重组 → 解码 → 同步呈现
 ```
 
-这里有三个容易混淆的动作：
+**重封装**保留编码数据，重建边界、配置与时间戳；**转码**先解码再编码。协议网关可能同时完成重封装，例如 RTMP→HTTP-FLV。应先核对目标编码、Profile/Level、像素格式、音频配置与加密能力；支持 H.264 并不等于支持其所有 Profile。RTP 既可按本章所述直接承载编码媒体，也可以按另一种 Payload Format 承载 TS，二者不是同一条打包路径。
 
-- **Remux/Transmux（重封装）**：编码数据不变，只重建容器、索引和时间戳表示。例如 H.264/AAC 的 RTMP 输入转成 HLS fMP4。
+### 8.2 时间戳换算：先展开，再缩放，最后重建
 
-- **Transcode（转码）**：先解码再编码，编码格式、分辨率、码率或帧率发生变化。它开销更大，也会引入新的 GOP 和编码延迟。
-
-- **Protocol gateway（协议网关）**：只改变传输层，例如 RTMP Message 转 HTTP-FLV Tag；可能同时做极轻量的封装补头，但不必改媒体编码。
-
-判断能否纯重封装的第一步是核对**目标容器和播放端是否支持原编码、Profile、Level、像素格式、音频对象类型及加密方式**。容器支持 H.264 并不等于终端一定支持源流的 High 4:4:4 Profile。
-
-### 7.2 时间戳换算：先展开，再缩放，最后重建
-
-四种常见时间基不同：
+先确定源时基、时间原点及字段语义：
 
 |来源|常见时间单位|
 |---|---|
@@ -1039,8 +1281,18 @@ Player
 |MPEG-2 TS PTS/DTS|1/90000 秒|
 |fMP4 视频 Track|由 `mdhd.timescale` 决定，常见 90000|
 |fMP4 AAC Track|由 `mdhd.timescale` 决定，常见等于采样率|
+|H.264 RTP|1/90000 秒；随机初值，Timestamp 不直接提供 DTS|
 
-从源时基 $S_{src}$ 转到目标时基 $S_{dst}$ 的基本公式是：
+常见范围如下；**循环计数器的回绕与文件字段容量耗尽不同**：
+
+|字段|边界|
+|---|---|
+|FLV / RTMP 毫秒时间|FLV 低 24 bit 约 4.66 小时进位；无符号 32 bit 周期约 49.71 天；FLV 规范 SI32 正值范围约 24.86 天|
+|TS PTS/DTS/PCR base|33 bit、90 kHz，约 26.51 小时回绕|
+|H.264 RTP Timestamp|32 bit、90 kHz，约 13.26 小时回绕；序号另按 16 bit 回绕|
+|fMP4 `tfdt` v0|32 bit；90 kHz 下约 13.26 小时耗尽，不能直接按 RTP 方式静默回绕，应使用 v1 的 64 bit 字段|
+
+仅换算单位且保持同一时间原点时：
 
 $$
 T_{dst} = \operatorname{round}\left(
@@ -1048,15 +1300,15 @@ T_{dst} = \operatorname{round}\left(
 \right)
 $$
 
-工程实现还必须遵守以下顺序：
+若源与目标原点不同，应换算时间差：`T_dst = O_dst + round((T_src−O_src)×S_dst/S_src)`。RTP→文件还要建立连续时间原点，音视频之间利用 SR 等映射对齐。实现时依次处理：
 
-1. **重建并展开计数**：RTMP 先根据 fmt Header 的绝对 timestamp 或 delta 重建 Message 时间，再把 TS 的 33 bit、RTMP/FLV 的 32 bit 位模式恢复成连续的较宽整数。若先缩放再判断回绕，边界附近很容易被误判。
-2. **识别 discontinuity**：时间戳回退可能是回绕、重连、Seek、广告拼接或编码器重启；只有回绕适合按模数连续展开，其余情况通常要开启新时间线。
+1. **重建并展开计数**：RTMP 先根据 fmt Header 的绝对 timestamp 或 delta 重建 Message 时间，再把 TS 的 33 bit、RTP 和 RTMP/FLV 的 32 bit 位模式恢复成连续的较宽整数。若先缩放再判断回绕，边界附近很容易被误判。
+2. **识别 discontinuity**：先排除包乱序和视频呈现重排序；含 B 帧的 PTS/RTP Timestamp 按解码顺序观察时可能正常回退。确认是回绕后才连续展开；重连、Seek、拼接或源重启则按会话与外部信令判断是否建立新时间线。
 3. **分别保存 DTS 与 PTS**：对视频计算 $CTO = PTS-DTS$；不能只保留一个“timestamp”后猜另一个。
 4. **用整数有理数换算**：避免浮点累计误差；实现应先约分或使用足够宽的中间整数，防止乘法溢出。逐帧 duration 的余数应累计到后续帧，或者直接缩放累计时间边界，再由相邻边界相减。
 5. **按 Track 独立量化**：视频和音频分别在自己的 timescale 上生成单调 DTS，再映射到共同呈现时间。音频 44.1 kHz 与视频 90 kHz 不能逐包硬凑成相同整数。
 
-对 $n$ bit 循环计数器，若已经排除 discontinuity，且相邻真实间隔不可能达到半个周期，可用最短有符号差展开：
+对 $n$ bit 循环计数器，若已经排除 discontinuity，且相邻真实时间差的绝对值小于半个周期，可用最短有符号差展开：
 
 $$
 d_k =
@@ -1069,9 +1321,9 @@ $$
 X_k = X_{k-1}+d_k
 $$
 
-其中 $x_k$ 是线上的循环值，$X_k$ 是展开后的宽整数。该算法对 TS 的 33 bit 或常见 RTMP/FLV 32 bit 计数都适用，但前提很重要：长时间断流超过半周期、Seek、编码器重启或广告拼接时，必须借助 discontinuity 和外部时间线重新定锚，不能盲目选择“最短距离”。
+其中 $x_k$ 是循环值，$X_k$ 是展开后的宽整数。使用 RTP 时还须先处理包乱序；超过半周期的断流或源重启应借助外部时间线重新定锚。该公式不适用于把 `tfdt` 溢出解释成合法回绕。
 
-例如 FLV 中 `DTS=1000 ms`、`CompositionTime=67 ms` 的 AVC Tag，转到 90 kHz 视频 Track 后可得到近似：
+例如 FLV 中 `DTS=1000 ms`、`CompositionTime=67 ms` 的 AVC Tag，保持时间原点转到 90 kHz 视频 Track 后得到：
 
 $$
 DTS=90000,\qquad CTO=6030,\qquad PTS=96030
@@ -1103,7 +1355,7 @@ $$
 
 若这样产生负 DTS，再给**所有相关轨道的共同时间线**增加足够大的全局偏移，或通过合规的 Edit List/清单时间映射补偿。核心不变量是：每轨 DTS 顺序、每帧 PTS、跨轨呈现对齐和随机访问边界必须同时保持；只修视频字段、不修共同时间原点同样会造成 A/V 偏移。
 
-### 7.3 H.264/HEVC 转封装：边界转换不等于重新编码
+### 8.3 H.264/HEVC 转封装：边界转换不等于重新编码
 
 #### Annex B → 长度前缀
 
@@ -1111,7 +1363,7 @@ TS 转 fMP4/FLV 时，通常需要：
 
 1. 从 PES payload 中组装完整 Access Unit，不能把每个 TS packet 当成一帧。
 2. 扫描 3 或 4 字节 Start Code，取出每个 NALU。
-3. 只去掉 Start Code，按目标配置写入 1/2/4 字节大端长度，再写 NALU 本体。NALU 内防止伪 Start Code 的 `emulation_prevention_three_byte`（常见 `00 00 03` 中的 `03`）属于 EBSP，不应在单纯转封装时删除。
+3. 解析 Annex B 的 Start Code 及其外层 leading/trailing zero 字节，提取准确的 NALU 边界；按目标配置写入长度前缀，再写 NALU 本体。不要把 Start Code 附近的外层零字节计入 NALU，也不要删除 NALU 内的 `emulation_prevention_three_byte`（`03`）。
 4. AVC 收集 SPS/PPS 并生成 `AVCDecoderConfigurationRecord`；HEVC 收集 VPS/SPS/PPS 并生成 `HEVCDecoderConfigurationRecord`。根据 `avc1/avc3`、`hvc1/hev1` 的 Sample Entry 规则决定参数集允许出现的位置，不能把 in-band 更新静默藏在“仅配置记录”的类型中。
 5. 根据真实随机访问语义设置 FLV FrameType、ISO BMFF sample flags/SAP 或 HLS 独立性信令，而不是只凭“包含 I Slice”判断；HEVC 还要区分 IDR、CRA、BLA 和 leading picture。
 
@@ -1129,23 +1381,21 @@ fMP4/FLV 转 TS 时，AVC 按 `lengthSizeMinusOne + 1`、HEVC 按 `HEVCDecoderCo
 
 对于 `avc1`/`hvc1` 样本条目，解码参数来自初始化记录；为了让 TS 分段可独立加入，muxer 常在随机访问 Access Unit 前注入最新 AVC SPS/PPS 或 HEVC VPS/SPS/PPS。对于 `avc3`/`hev1` 等允许 in-band 参数集的样本条目，还要按 sample 顺序处理更新，避免继续使用过期配置。
 
-### 7.4 AAC 转封装：ASC、Raw AAC 与 ADTS
+#### RTP ↔ 容器
 
-- **FLV**：Sequence Header 承载 ASC，后续 AAC Tag 承载 Raw AAC access unit。
+发送前从 sample/字节流提取 NALU，按第 6.4 节打包；接收时先去聚合或重组，再加 Start Code 或长度前缀。RTP Timestamp 不直接提供 DTS，含 B 帧时不能无条件写 `DTS=PTS`；必须结合可靠的解码顺序与时间信息构建 sample。
 
-- **fMP4**：Sample Entry 的 `esds`/其他适用配置 Box 描述解码配置，sample 承载不含 ADTS 的编码访问单元。
+### 8.4 AAC 转封装：ASC、Raw AAC 与 ADTS
 
-- **传统 TS/HLS**：常见做法是每个 AAC access unit 前带 ADTS Header。
+FLV/fMP4 用初始化配置携带 ASC、媒体单元承载 Raw AAC；传统 TS/HLS 常用 ADTS。转换重点是配置表达能力和 raw data block 边界。
 
-TS/ADTS 转 FLV 或 fMP4 时，应解析 ADTS 的 profile、sampling frequency index、channel configuration、13 bit `aac_frame_length`、CRC 标志和 `num_raw_data_blocks_in_frame`；`aac_frame_length` 包含 ADTS Header 与编码负载总长。完成边界校验后再剥掉 7/9 字节 Header。最常见的 `num_raw_data_blocks_in_frame=0` 表示该 ADTS frame 含一个 raw data block；其他值不能继续按“一个 ADTS frame 固定等于一个 1024-sample sample”处理。
+TS/ADTS 转 FLV 或 fMP4 时，应解析 ADTS 的 profile、sampling frequency index、channel configuration、13 bit `aac_frame_length`、CRC 标志和 `num_raw_data_blocks_in_frame`；`aac_frame_length` 包含 ADTS Header 与编码负载总长。当 `num_raw_data_blocks_in_frame=0` 时，帧内为单个 raw data block，无 CRC/有 CRC 的头部处理分别为 7B/9B。多 raw data block 且带 CRC 时，还涉及位置字段与各 block 的校验，不能统一只剥 9B；应按完整 ADTS 语法提取，再按目标格式重建访问单元。
 
 ADTS Header 的 2 bit profile 只直接表达有限的基础 AOT，无法完整携带任意 ASC。HE-AAC 的 SBR/PS 可能通过编码负载中的隐式/同步扩展出现，`channel_configuration=0` 还需要 Program Config Element。因此，从 ADTS 生成 ASC 时必须结合码流或可靠的上游配置；只由头部三项拼一个 ASC，可能把 HE-AAC 错标成 AAC-LC。反向转换也要先确认目标 AOT、频率和声道布局能够用 ADTS 表达。
 
 不能把 ADTS Header 当成 AAC 编码负载写入 MP4 sample，也不能只复制一个固定的 `12 10` 去处理所有音频。若目标格式无法无损表达源配置，应保留为适用的原格式、转码或显式拒绝，而不是静默降级配置。
 
-在成功确认配置后，反向转换才可根据 ASC 为每个适用的 access unit 重建 ADTS Header，并以目标规范要求的 sample/帧边界输出。
-
-### 7.5 常见转换路径的字段映射
+### 8.5 常见转换路径的字段映射
 
 |转换路径|可以直接复用的内容|必须重建的内容|
 |---|---|---|
@@ -1153,7 +1403,7 @@ ADTS Header 的 2 bit profile 只直接表达有限的基础 AOT，无法完整�
 |FLV/RTMP → fMP4|受双方支持的 AVC/HEVC NALU、Raw AAC 和 codec configuration record|区分 legacy/Enhanced 头，重建 `ftyp/moov`、Track/Sample Entry、`moof/trun/tfdt`、sample flags、mdat 偏移|
 |TS → fMP4|解出的 AVC/HEVC NALU、可兼容的 AAC 编码负载|PAT/PMT/PES 解复用、时间戳展开、Annex B→长度前缀、ADTS→ASC、Fragment 索引|
 |fMP4 → TS|sample 内编码数据与 DTS/PTS|长度前缀→Annex B、ASC→ADTS、PES、PAT/PMT、PCR、PID/continuity counter|
-|RTMP → HTTP-FLV → MSE fMP4|首段可复用 AVC/AAC 编码负载|网关先生成 FLV，浏览器侧仍需再次 transmux 为 ISO BMFF 才能喂给多数 MSE SourceBuffer|
+|H.264 RTP → fMP4|完整重组后的 NALU|去聚合/重组、AU 边界、SPS/PPS、长度前缀、DTS/PTS 与 sample flags|
 
 #### FLV/RTMP → fMP4 的最小状态机
 
@@ -1175,7 +1425,7 @@ ADTS Header 的 2 bit profile 只直接表达有限的基础 AOT，无法完整�
 计算 trun.data_offset → 写 mdat
 ```
 
-`trun.data_offset` 依赖最终 `moof` 大小，所以常见实现会先构建/测量 `moof`，再回填偏移。sample duration 则通常要等下一个 DTS 才能精确知道；实时打包器需要保留至少一个待定 sample，或采用已知恒定 duration，结束时再处理最后一个 sample。
+在媒体紧随 `moof`、寻址基址为 `moof` 的常见布局中，`trun.data_offset` 依赖最终 `moof` 大小和 `mdat` 头长度，因此通常先测量结构再回填。sample duration 则通常要等下一个 DTS 才能精确知道；实时打包器需要保留至少一个待定 sample，或采用已知恒定 duration，结束时再处理最后一个 sample。
 
 #### TS → fMP4 的额外状态
 
@@ -1183,23 +1433,28 @@ TS 输入还要维护：
 
 - PAT/PMT 版本、Program、stream PID 与 PCR PID
 - 每个 PID 的 continuity counter 和 PES 重组缓冲
-- 33 bit PTS/DTS/PCR 的展开状态
+- 33 bit PTS/DTS/PCR base 的展开状态，以及 PCR extension
 - AVC/HEVC Access Unit 组装器、随机访问状态与最新参数集
 - 音视频各自的 Track 时间线和分片边界
 
 丢失带 `PUSI=1` 的 PES 起始包后，不应把后续中间 payload 冒充完整 sample；应丢弃到可恢复边界，并把缺口传播成 discontinuity 或损坏状态。
 
-### 7.6 初始化信息、关键帧与配置变化
+---
 
-“先发初始化信息、再发可随机访问媒体”是三类封装共同的首屏原则，但具体载体不同：
+## 九、工程检查与格式选择
+
+### 9.1 首屏、中途加入与配置切换
+
+首屏与中途加入都需要匹配的解码配置和可随机访问的媒体。配置切换必须保持二者版本一致：
 
 |格式|初始化/信令|随机访问起点|配置变化时|
 |---|---|---|---|
 |fMP4|Init Segment：`ftyp + moov`|sample flags/SAP 与编码随机访问图像|发布匹配的新 Init Segment，清单切换 `EXT-X-MAP`/表示；必要时声明 discontinuity|
 |FLV/RTMP|Legacy AVC/AAC Sequence Header，或 Enhanced FourCC SequenceStart，常配合 metadata|实际可随机访问的 Video Tag/Message|先发新的配置消息，再发使用新配置的媒体；服务端缓存也要原子更新|
-|TS|PAT/PMT + in-band 参数集/音频头|随机访问 Access Unit，可辅以 `random_access_indicator`|若 PMT 内容变化则递增版本；发送新参数集，并按实际变化处理 PID、continuity 与时间基 discontinuity|
+|TS|PAT/PMT + in-band 参数集/音频头|随机访问 Access Unit，可辅以 `random_access_indicator`|PMT 内容改变时更新版本；处理参数集及时间基变化|
+|WebRTC H.264|SDP 协商 + in-band SPS/PPS|收到完整可解码 AU；必要时请求 PLI|在媒体使用前发送新参数集；超出协商能力时重新协商|
 
-配置切换的危险窗口是“旧初始化信息配上新媒体”。如果分辨率或 SPS 已改变，却仍把新 sample 挂在旧 `avc1` Sample Entry 下，Box 结构即使完全合法，解码器仍可能失败。发布端应确保清单、初始化段和首个媒体分片的可见顺序一致，播放器则应按清单关系选择 Init Segment，而不是永远缓存第一个。
+例如新分辨率的 sample 不能继续使用不匹配的旧 `avc1` 配置。服务端应协调初始化信息、媒体与清单的发布/缓存更新；FLV 可缓存配置与可解码 GOP，TS 可在分段边界重复 PSI/参数集，WebRTC 还需完成 ICE 与媒体密钥协商。
 
 关键帧也要区分三层：
 
@@ -1209,7 +1464,26 @@ TS 输入还要维护：
 
 只有三层信令与实际依赖一致，播放器才能安全首播、Seek 和 ABR 切换。
 
-### 7.7 延迟来自整条流水线
+若无缓存或主动刷新，只能等待周期性 IDR，2 秒 IDR 间隔意味着理想条件下最多约 2 秒的额外等待；丢包、建连与缓冲仍会增加实际首屏时间。
+
+### 9.2 音视频不同步与损坏定位
+
+先按各轨时基和时间原点对齐呈现时间，再定位异常层：
+
+|链路|主要检查点|
+|---|---|
+|fMP4|`tfdt`、duration、CTO、Edit List 与清单时间线；初始化配置是否匹配|
+|FLV/RTMP|Chunk 重组、DTS 与有符号 CompositionTime；不能只比较相邻音视频 Tag|
+|TS|CC/TEI、PES 完整性、PCR 连续性、PTS/DTS 及 discontinuity|
+|WebRTC|序号缺口、FU 重组、播放截止时间、RTCP SR 映射与源关联；STUN 成功不代表解码条件已齐备|
+
+遇到计数边界按第 8.2 节展开；重连、Seek、源重启或拼接则应明确重建时间线。持续同步漂移还应检查采集时钟及重采样策略。
+
+### 9.3 Seek 与直播时移
+
+Seek 需要“时间→数据位置”的索引、对应解码配置和随机访问点。fMP4 可用清单、`sidx/tfra` 或外部索引；FLV 可用关键帧索引；TS/HLS 常用 Playlist。直播时移还需要服务端保留历史媒体窗口，单靠格式无法实现。实时 RTP 会话若要回看，通常另建录制和索引链路。
+
+### 9.4 端到端延迟
 
 端到端直播延迟可以粗略拆成：
 
@@ -1222,77 +1496,18 @@ L \approx L_{\text{capture}}
 + L_{\text{decode/render}}
 $$
 
-缩短 fMP4 Chunk、HLS Partial Segment 或 RTMP Chunk 只能影响其中一部分。编码器 B 帧重排、长 GOP、源站聚合、TCP 丢包重传、Playlist 刷新和播放器安全缓冲都可能成为主导项。低延迟优化必须同时观测采集时间、编码时间、媒体时间、服务端发布时间和客户端呈现时间，不能仅凭“格式名称”判断延迟。
+CMAF Chunk/HLS Part 的时长影响媒体何时可交付；RTMP Chunk Size 则是字节分块大小，主要影响消息交织与调度，两者不能等同。B 帧重排、等待随机访问点、网络重传和播放缓冲都可能主导延迟，应沿采集、编码、发布、接收、呈现各节点测量。
 
----
+### 9.5 按交付需求选择
 
-## 八、直播场景常见工程问题
+|需求|常见组合|主要约束|
+|---|---|---|
+|HTTP 点播 / 自适应直播|fMP4/CMAF + HLS/DASH|初始化段、随机访问边界、清单和终端 codec 支持|
+|既有直播推流与 HTTP-FLV|RTMP + FLV 数据模型|Legacy/Enhanced 兼容性、TCP 队头阻塞、播放缓冲|
+|广播与既有 TS 系统|TS + 广播传输，或经 SRT 等交付|PSI、PCR、固定包开销及外层恢复机制|
+|实时互动|WebRTC：ICE/STUN + DTLS-SRTP + RTP/RTCP|连通性、协商、拥塞控制、丢包恢复与播放截止时间|
 
-### 8.1 首屏时间（首帧出图）优化
-
-核心瓶颈：拿到解码参数 + 等到关键帧
-
-- **fMP4：**确保初始化段可快速获取，并从含随机访问点的目标 Segment/Chunk 开始；初始化段大小和首屏时间没有固定常数
-
-- **FLV：**服务器缓存 Sequence Header + 最近 GOP → 新用户加入立即发送
-
-- **TS：**获得 PAT + PMT、解码参数及可用的随机访问点；工程上常在分段边界重复这些初始化信息
-
-- **关键：**若只能等待下一处 IDR，固定 2 秒 IDR 间隔带来的等待上界约为 2 秒；实际首屏还叠加建连、清单、网络、解复用、解码和播放器缓冲
-
-### 8.2 中途加入问题
-
-缺少解码参数 → 黑屏/无声
-
-- **fMP4：**先获得与目标媒体段匹配的初始化段；源站、清单和播放器必须保证它可寻址且版本正确
-
-- **FLV：**服务端必须缓存并补发 Sequence Header
-
-- **TS：**等待可用随机访问点，并确保 PAT/PMT、参数集和音频配置都已获得；关键帧不保证天然携带 SPS/PPS
-
-### 8.3 音视频不同步诊断
-
-- 先把不同轨道的时间戳按各自 timescale 归一化到同一时间单位，再比较呈现时间。告警阈值应结合业务的可感知标准、设备链路和连续偏差窗口设置，不宜把 200ms 当作格式规范
-
-- **fMP4：**检查 `tfdt`、sample duration、CTO、编辑列表和协议层时间线；不要直接比较不同 timescale 的整数值
-
-- **FLV：**分别重建音频呈现时间和视频 $PTS=DTS+CompositionTime$，再放到同一时间轴比较；不能只取文件中恰好相邻的两个 Tag 做差
-
-- **TS：**检查 PCR 连续性/抖动、PTS/DTS 展开、continuity counter 和 discontinuity 标志
-
-- 常见原因：采集或编码时钟漂移、错误的 timescale 换算、丢包/缺片、时间戳回绕、重排序处理错误和 discontinuity 未重置
-
-### 8.4 时间戳回绕/溢出
-
-- **FLV：**低 24 位约 4.66 小时进位；完整位模式的解释需区分规范 `SI32` 与直播栈常见无符号计数，不能一概写成 49.7 天
-
-- **TS：**33 bit PTS/DTS 在 90kHz 下约 26.5 小时回绕；PCR base 也需按循环计数处理
-
-- **fMP4：**`tfdt` version 0 是 32 位，在 90kHz 下约 13.26 小时到达上限；version 1 是 64 位。解析器必须先读 version，再按对应位宽解析
-
-### 8.5 直播 Seek（时移回看）
-
-- **fMP4 + DASH/HLS：**通常由清单、Segment/Byte Range、随机访问点和服务端保留窗口共同实现，并非容器自动提供时移能力
-
-- **FLV：**需要服务端维护关键帧索引
-
-- **TS + HLS：**通过 Media Playlist 的 Segment 列表、时间线与服务端保留窗口实现
-
----
-
-## 九、总结
-
-不存在一种格式覆盖所有媒体系统。选择容器与协议时，应先看交付方式、随机访问、浏览器/硬件兼容、延迟预算、弱网策略和既有生态。
-
-- **fMP4/CMAF** 是现代 HTTP 自适应流媒体的重要基础，可被 DASH 和 HLS 复用，但 CMAF 本身不规定清单与传输协议
-
-- **FLV/RTMP** 是直播时代的经典组合：FLV 负责音视频 Tag 数据模型，RTMP 负责实时传输；HTTP-FLV 仍常用于直播播放链路
-
-- **TS** 在广播、传统 HLS 和既有硬件链路中仍占重要位置；fMP4/CMAF 在点播、跨 HLS/DASH 复用和低延迟 HTTP 流媒体中更常见
-
-- **NALU 的两种封装**（长度前缀 vs Annex B）是 AVC/HEVC 格式转换的核心
-
-- **趋势：**点播与标准化分段流媒体大量采用 fMP4/CMAF；实时互动则常采用 WebRTC，可靠低延迟贡献链路还可能选择 SRT/RIST。QUIC/HTTP/3 是传输层/HTTP 映射，可以承载分段媒体，但不是 fMP4、FLV 或 TS 的直接“容器替代品”
+QUIC/HTTP/3 是传输及 HTTP 映射，不是 fMP4、FLV 或 TS 的容器替代品。具体方案应结合兼容性、延迟预算、随机访问和运维需求选择。
 
 ---
 
@@ -1329,3 +1544,23 @@ $$
 - [Adobe RTMP Specification 1.0（存档副本）](https://veovera.org/docs/legacy/rtmp-v1-0-spec.pdf)
 
 - [Veovera Enhanced RTMP v2 Specification](https://veovera.org/docs/enhanced/enhanced-rtmp-v2.html)
+
+- [RFC 3550：RTP / RTCP 基础格式](https://www.rfc-editor.org/rfc/rfc3550)
+
+- [RFC 8285：RTP Header Extensions](https://www.rfc-editor.org/rfc/rfc8285)
+
+- [RFC 4585：RTCP Feedback：NACK / PLI](https://www.rfc-editor.org/rfc/rfc4585)
+
+- [RFC 5506：Reduced-Size RTCP](https://www.rfc-editor.org/rfc/rfc5506)
+
+- [RFC 8489：STUN](https://www.rfc-editor.org/rfc/rfc8489)
+
+- [RFC 8445：ICE](https://www.rfc-editor.org/rfc/rfc8445)
+
+- [RFC 8834：WebRTC 媒体传输](https://www.rfc-editor.org/rfc/rfc8834)
+
+- [RFC 7742：WebRTC 视频与 H.264 要求](https://www.rfc-editor.org/rfc/rfc7742)
+
+- [RFC 6184：H.264 RTP Payload Format](https://www.rfc-editor.org/rfc/rfc6184)
+
+- [RFC 7798：HEVC RTP Payload Format](https://www.rfc-editor.org/rfc/rfc7798)
